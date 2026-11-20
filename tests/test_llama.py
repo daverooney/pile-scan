@@ -1,6 +1,7 @@
-"""llama-server plumbing: build caching, model downloads, server args, HTTP reader.
+"""llama-server plumbing: runtime checks, prebuilt download, GPU code cache,
+model downloads, server args, HTTP reader.
 
-The real server needs a GPU; these use a fake build and a fake server process
+The real server needs a GPU; these use fake release tarballs and a fake server process
 (tests/fake_llama_server.py) that speaks the same HTTP API.
 """
 
@@ -53,77 +54,188 @@ def test_ctx_size_must_fit_page():
         ScanConfig(ctx_size=2048).validate()
 
 
-def test_build_commands_target_one_arch_static():
-    cfg_cmd, build_cmd = llama.build_commands(Path("/src"), Path("/src/build"), "75", 2)
-    assert "-DGGML_CUDA=ON" in cfg_cmd
-    assert "-DCMAKE_CUDA_ARCHITECTURES=75" in cfg_cmd
-    assert "-DBUILD_SHARED_LIBS=OFF" in cfg_cmd
-    assert build_cmd[-2:] == ["--target", "llama-server"]
+def test_release_assets_are_cuda_server_and_runtime():
+    urls = llama.release_assets("b12359", "12.8")
+    base = "https://github.com/ggml-org/llama.cpp/releases/download/b12359/"
+    assert urls == [base + "llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz",
+                    base + "cudart-llama-b12359-bin-ubuntu-cuda-12.8-x64.tar.gz"]
 
 
-def test_cuda_arch_parses_nvidia_smi():
+# --- checking the runtime ---------------------------------------------------------
+
+def smi(line):
     def runner(cmd, **kw):
-        return subprocess.CompletedProcess(cmd, 0, stdout="7.5\n", stderr="")
-
-    assert llama.cuda_arch(runner) == "75"
-
-
-# --- build caching ----------------------------------------------------------------
-
-class FakeBuild:
-    """Records commands; 'builds' llama-server as a copy of a tiny script."""
-
-    def __init__(self):
-        self.calls = []
-
-    def __call__(self, cmd, **kw):
-        self.calls.append(cmd)
-        if cmd[0] == "git" and cmd[1] == "clone":
-            Path(cmd[-1]).mkdir(parents=True)
-        if cmd[0] == "cmake" and "--build" in cmd:
-            out = Path(cmd[cmd.index("--build") + 1]) / "bin" / "llama-server"
-            out.parent.mkdir(parents=True)
-            out.write_text("#!/bin/sh\necho fake\n")
-        if cmd[0] == "git" and "rev-parse" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
-        if cmd[-1] == "--version":
-            subprocess.run(cmd, check=True, capture_output=True)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    @property
-    def builds(self):
-        return sum(1 for c in self.calls if c[0] == "cmake" and "--build" in c)
+        return subprocess.CompletedProcess(cmd, 0, stdout=line + "\n", stderr="")
+    return runner
 
 
-def test_build_once_then_reuse_cache(tmp_path):
-    cfg = ScanConfig(cache_dir=str(tmp_path / "drive" / "cache"), local_dir=str(tmp_path / "vm1"))
-    fb = FakeBuild()
-    b1 = llama.ensure_server_binary(cfg, runner=fb, arch="75", log=lambda *_: None)
-    assert fb.builds == 1 and b1.exists()
-    entry = llama.cache_entry(cfg.cache_dir, cfg.llama_cpp_ref, "75")
-    info = json.loads((entry / "build-info.json").read_text())
-    assert info["commit"] == "abc123" and info["cuda_arch"] == "75"
-    assert not list(entry.glob("*.tmp-*"))
-
-    # A fresh VM (empty local disk) reuses the Drive copy without building.
-    cfg2 = ScanConfig(cache_dir=cfg.cache_dir, local_dir=str(tmp_path / "vm2"))
-    b2 = llama.ensure_server_binary(cfg2, runner=fb, arch="75", log=lambda *_: None)
-    assert fb.builds == 1
-    assert b2.stat().st_mode & 0o111  # executable bit restored
-
-    # A different GPU type gets its own build.
-    llama.ensure_server_binary(cfg2, runner=fb, arch="89", log=lambda *_: None)
-    assert fb.builds == 2
+T4 = "Tesla T4, 580.82.07, 7.5, 15360"
+L4 = "NVIDIA L4, 580.82.07, 8.9, 23034"
 
 
-def test_broken_cached_binary_is_rebuilt(tmp_path):
-    cfg = ScanConfig(cache_dir=str(tmp_path / "cache"), local_dir=str(tmp_path / "vm"))
-    entry = llama.cache_entry(cfg.cache_dir, cfg.llama_cpp_ref, "75")
-    entry.mkdir(parents=True)
-    (entry / "llama-server").write_text("not a program")
-    fb = FakeBuild()
-    llama.ensure_server_binary(cfg, runner=fb, arch="75", log=lambda *_: None)
-    assert fb.builds == 1
+def test_environment_ok_on_current_runtime():
+    gpu = llama.check_environment(ScanConfig(), runner=smi(T4), glibc=(2, 39), log=lambda *_: None)
+    assert gpu.name == "Tesla T4" and gpu.compute_cap == "7.5" and gpu.needs_jit
+    gpu = llama.check_environment(ScanConfig(), runner=smi(L4), glibc=(2, 39), log=lambda *_: None)
+    assert not gpu.needs_jit
+
+
+def test_old_runtime_fails_with_fix():
+    with pytest.raises(llama.EnvironmentProblem, match="Runtime version"):
+        llama.check_environment(ScanConfig(), runner=smi(T4), glibc=(2, 35))
+
+
+def test_no_gpu_fails_with_fix():
+    def runner(cmd, **kw):
+        raise FileNotFoundError("nvidia-smi")
+    with pytest.raises(llama.EnvironmentProblem, match="pick a GPU"):
+        llama.check_environment(ScanConfig(), runner=runner, glibc=(2, 39))
+
+
+def test_old_driver_fails():
+    with pytest.raises(llama.EnvironmentProblem, match="driver 535"):
+        llama.check_environment(ScanConfig(), runner=smi("Tesla T4, 535.104.05, 7.5, 15360"), glibc=(2, 39))
+
+
+def test_8bit_on_t4_warns():
+    msgs = []
+    llama.check_environment(ScanConfig(quantization="8bit"), runner=smi(T4), glibc=(2, 39), log=msgs.append)
+    assert any("may not fit" in m for m in msgs)
+    msgs.clear()
+    llama.check_environment(ScanConfig(), runner=smi(T4), glibc=(2, 39), log=msgs.append)
+    assert not any("may not fit" in m for m in msgs)
+
+
+# --- downloading the prebuilt server ------------------------------------------------
+
+def make_release_tar(path: Path, top: str, files: dict[str, bytes], links: dict[str, str] = {}):
+    import io
+    import tarfile
+
+    with tarfile.open(path, "w:gz") as tf:
+        for name, data in files.items():
+            info = tarfile.TarInfo(f"{top}/{name}")
+            info.size = len(data)
+            info.mode = 0o755 if name == "llama-server" else 0o644
+            tf.addfile(info, io.BytesIO(data))
+        for name, target in links.items():
+            info = tarfile.TarInfo(f"{top}/{name}")
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            tf.addfile(info)
+
+
+def test_prebuilt_download_unpacks_flat_and_is_reused(tmp_path):
+    fetched = []
+
+    def fake_download(url, dest, *, token=None, log=print):
+        fetched.append(url)
+        name = url.rsplit("/", 1)[1]
+        if name.startswith("cudart"):
+            make_release_tar(dest, name.removesuffix(".tar.gz"), {"libcudart.so.12.8.90": b"rt"},
+                             {"libcudart.so.12": "libcudart.so.12.8.90"})
+        else:
+            make_release_tar(dest, "llama-b12359", {"llama-server": b"#!/bin/sh\n",
+                                                     "libggml-cuda.so": b"cuda"})
+
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm"))
+    server = llama.ensure_server_binary(cfg, download=fake_download, log=lambda *_: None)
+    assert len(fetched) == 2
+    folder = server.parent
+    assert server.name == "llama-server" and server.stat().st_mode & 0o111
+    # Libraries sit next to the server, where its RUNPATH ($ORIGIN) looks.
+    assert (folder / "libggml-cuda.so").read_bytes() == b"cuda"
+    assert (folder / "libcudart.so.12").read_bytes() == b"rt"
+    assert not list((tmp_path / "vm" / "downloads").iterdir())   # tarballs removed
+
+    llama.ensure_server_binary(cfg, download=fake_download, log=lambda *_: None)
+    assert len(fetched) == 2
+
+
+def test_half_unpacked_server_is_redownloaded(tmp_path):
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm"))
+    folder = tmp_path / "vm" / f"llama-{cfg.llama_cpp_build}-cuda-{cfg.llama_cpp_cuda}"
+    folder.mkdir(parents=True)
+    (folder / "llama-server").write_text("partial")   # no .complete marker
+    calls = []
+
+    def fake_download(url, dest, *, token=None, log=print):
+        calls.append(url)
+        make_release_tar(dest, "x", {"llama-server": b"ok"})
+
+    llama.ensure_server_binary(cfg, download=fake_download, log=lambda *_: None)
+    assert len(calls) == 2 and (folder / "llama-server").read_bytes() == b"ok"
+
+
+def script(tmp_path, body):
+    path = tmp_path / "llama-server"
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_verify_server_sees_cuda(tmp_path):
+    binary = script(tmp_path, f'exec {sys.executable} {FAKE_SERVER} "$@"')
+    assert llama.verify_server(binary).startswith("CUDA0: Tesla T4")
+
+
+def test_verify_server_fails_when_cuda_backend_missing(tmp_path):
+    binary = script(tmp_path, 'echo "Available devices:"; echo "  (none)"')
+    with pytest.raises(llama.EnvironmentProblem, match="can't see the GPU"):
+        llama.verify_server(binary)
+
+
+def test_verify_server_explains_glibc_error(tmp_path):
+    binary = script(tmp_path, "echo \"llama-server: /lib/x86_64-linux-gnu/libc.so.6: version "
+                              "\\`GLIBC_2.38' not found\" >&2; exit 1")
+    with pytest.raises(llama.EnvironmentProblem, match="newer glibc"):
+        llama.verify_server(binary)
+
+
+# --- GPU code cache on Drive ---------------------------------------------------------
+
+def test_jit_cache_round_trip(tmp_path):
+    gpu = llama.GpuInfo("Tesla T4", "580.82.07", "7.5", 15360)
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm1"), cache_dir=str(tmp_path / "drive"))
+    jit = llama.JitCache(cfg, gpu, log=lambda *_: None)
+    assert jit.restore() is False
+    env = jit.env()
+    assert env["CUDA_CACHE_PATH"] == str(jit.local)
+    assert env["CUDA_CACHE_MAXSIZE"] == str(4 * 1024 ** 3)
+    assert jit.save() is False                        # nothing compiled yet
+    (jit.local / "ComputeCache" / "a").mkdir(parents=True)
+    (jit.local / "ComputeCache" / "index").write_bytes(b"idx")
+    (jit.local / "ComputeCache" / "a" / "k1").write_bytes(b"kernel")
+    assert jit.save() is True
+    assert jit.save() is False                        # unchanged: no second upload
+    assert "Tesla-T4-580.82.07" in jit.drive_file.name and cfg.llama_cpp_build in jit.drive_file.name
+
+    cfg2 = ScanConfig(local_dir=str(tmp_path / "vm2"), cache_dir=cfg.cache_dir)
+    jit2 = llama.JitCache(cfg2, gpu, log=lambda *_: None)
+    assert jit2.restore() is True
+    assert (jit2.local / "ComputeCache" / "a" / "k1").read_bytes() == b"kernel"
+    assert jit2.save() is False                       # restored copy needs no upload
+
+    # A different driver gets its own cache file.
+    other = llama.JitCache(cfg2, llama.GpuInfo("Tesla T4", "590.10", "7.5", 15360), log=lambda *_: None)
+    assert other.drive_file != jit.drive_file
+
+
+def test_corrupt_jit_cache_is_ignored(tmp_path):
+    gpu = llama.GpuInfo("Tesla T4", "580.82.07", "7.5", 15360)
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm"), cache_dir=str(tmp_path / "drive"))
+    jit = llama.JitCache(cfg, gpu, log=lambda *_: None)
+    jit.drive_file.parent.mkdir(parents=True)
+    jit.drive_file.write_bytes(b"not a tar")
+    assert jit.restore() is False
+
+
+def test_server_gets_cache_environment(tmp_path):
+    args = [sys.executable, "-c", "import os, sys; print('cache=' + os.environ['CUDA_CACHE_PATH']); sys.exit(1)"]
+    server = llama.LlamaServer(args, port=free_port(), log_path=tmp_path / "s.log", log=lambda *_: None,
+                               env={**__import__("os").environ, "CUDA_CACHE_PATH": "/x/jit"})
+    with pytest.raises(RuntimeError, match="cache=/x/jit"):
+        server.start(timeout=10)
 
 
 # --- model files ----------------------------------------------------------------
@@ -212,6 +324,18 @@ def test_reader_sends_image_first_and_counts_image_tokens(fake_server, tmp_path)
     assert sent["temperature"] == 0
     assert sent["chat_template_kwargs"] == {"enable_thinking": False}
     assert sent["max_tokens"] == cfg.max_new_tokens
+
+
+def test_after_read_hook_runs_per_page(fake_server):
+    from PIL import Image
+
+    server, port, _ = fake_server
+    calls = []
+    reader = llama.LlamaPageReader(server, ScanConfig(server_port=port), log=lambda *_: None,
+                                   after_read=lambda: calls.append(1))
+    reader.read(Image.new("RGB", (8, 8)), "p")
+    reader.read(Image.new("RGB", (8, 8)), "p")
+    assert len(calls) == 2
 
 
 def test_recover_restarts_dead_server(fake_server):

@@ -12,12 +12,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--port", type=int, required=True)
+ap.add_argument("--port", type=int)
 ap.add_argument("--record-dir")
 ap.add_argument("--version", action="store_true")
+ap.add_argument("--list-devices", action="store_true")
 args, _ = ap.parse_known_args()
 if args.version:
     print("fake llama-server")
+    raise SystemExit(0)
+if args.list_devices:
+    print("Available devices:\n  CUDA0: Tesla T4 (15095 MiB, 14992 MiB free)")
     raise SystemExit(0)
 STARTED = time.time()
 COUNTER = {"n": 0}

@@ -14,12 +14,14 @@ No hosted model APIs are used. Pages are read by llama.cpp's `llama-server` runn
 
 1. Put your scans in a Drive folder, e.g. `My Drive/pile-scan/inbox`. Images (PNG, JPEG, TIFF including multi-page, WebP, BMP, GIF) and PDFs are read; anything else is skipped and listed. Subfolders are included.
 2. Open [`notebooks/01_scan.ipynb` in Colab](https://colab.research.google.com/github/daverooney/pile-scan/blob/main/notebooks/01_scan.ipynb).
-3. **Runtime > Change runtime type**: T4 GPU (free) or L4 (Pro).
+3. **Runtime > Change runtime type**: T4 GPU (free) or L4 (Pro), with **Runtime version** on **Latest** (2026.10 or newer).
 4. Fill in the settings cell, then **Runtime > Run all**. Allow Drive access when asked.
 
 The database is written to `OUTPUT_DIR/DB_NAME` on Drive.
 
-**The first session on each GPU type compiles llama.cpp** (a T4 and an L4 each need their own build). The binary is saved to `CACHE_DIR` on Drive, so later sessions copy it back in seconds. Tick `REBUILD_LLAMA_SERVER` to force a fresh build. The model files (7.4 GB for 4-bit, 12.7 GB for 8-bit) download each session unless you tick `CACHE_MODELS_ON_DRIVE`.
+**llama.cpp comes prebuilt.** Each session downloads llama.cpp's own CUDA 12.8 release (about 800 MB, under a minute), so nothing is compiled in the notebook. The release needs glibc 2.38 or newer, which Colab's 2026.10 runtime (Ubuntu 24.04) has and older runtime versions don't; the notebook checks this first and tells you how to switch. It also checks that the server can see the GPU before loading the model, so a CUDA problem can't silently fall back to the CPU.
+
+**On a T4, the first session is slower.** The release has native GPU code for newer cards (like the L4) but only portable code for the T4, so the driver compiles each kernel the first time it's used. The compiled code is saved to `CACHE_DIR/cuda-jit` on Drive after server start and after every page while it's still growing, and restored at the start of later sessions. The model files (7.4 GB for 4-bit, 12.7 GB for 8-bit) download each session unless you tick `CACHE_MODELS_ON_DRIVE`.
 
 **When Colab disconnects**, reconnect and Run all again. The notebook copies the database back from Drive and skips every page already done. You lose at most the pages since the last checkpoint (`CHECKPOINT_EVERY`, default 10).
 
@@ -37,7 +39,7 @@ If this repo is private, add a Colab secret named `GITHUB_TOKEN` with a read-onl
 | `CACHE_MODELS_ON_DRIVE` | off | Keep the GGUF files on Drive too. Costs Drive space, saves a download per session. |
 | `DISCONNECT_WHEN_DONE` | off | Releases the GPU at the end so a finished run stops spending compute units. |
 
-The llama.cpp version is pinned in `pile_scan/config.py` (`LLAMA_CPP_REF`, currently `v1.0.0`). Changing it triggers a new build.
+The llama.cpp release is pinned in `pile_scan/config.py` (`LLAMA_CPP_BUILD`, currently `b12359`, and `LLAMA_CPP_CUDA`, `12.8`). Keep the CUDA version at or below what Colab's driver supports (`nvidia-smi` shows it; 13.0 on the 2026.10 runtime). A new release or driver starts a fresh T4 code cache.
 
 The first scanned page logs how many image tokens the model actually received (worked out from the server's prompt token counts). It should be close to the budget. A number near 280 means the setting didn't take effect.
 
@@ -83,4 +85,4 @@ uv lock
 uv export --frozen --no-dev --no-emit-project --no-hashes -o requirements-colab.txt
 ```
 
-The tests cover discovery, hashing, PDF and TIFF page splitting, reply parsing, checkpoints, resume after a simulated disconnect, the llama.cpp build cache, model downloads, and the HTTP calls to llama-server (against a fake server in `tests/fake_llama_server.py`). The real CUDA build and Gemma 4 itself only run in Colab.
+The tests cover discovery, hashing, PDF and TIFF page splitting, reply parsing, checkpoints, resume after a simulated disconnect, the runtime checks, unpacking the prebuilt release, the T4 code cache, model downloads, and the HTTP calls to llama-server (against a fake server in `tests/fake_llama_server.py`). The real GPU and Gemma 4 itself only run in Colab.

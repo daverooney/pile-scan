@@ -27,9 +27,13 @@ GGUF_FILES = {
 MMPROJ_FILE = "mmproj-F16.gguf"
 QUANTIZATIONS = tuple(GGUF_FILES)
 
-# llama.cpp release to build. v1.0.0 (2026-11-13) has the --image-min-tokens
-# and --image-max-tokens flags Gemma 4 needs. Changing it triggers a new build.
-LLAMA_CPP_REF = "v1.0.0"
+# llama.cpp release to download, prebuilt for CUDA, from
+# https://github.com/ggml-org/llama.cpp/releases. b12359 (2026-11-19) is newer
+# than v1.0.0 and has the --image-min-tokens / --image-max-tokens flags Gemma 4
+# needs. The CUDA 12.8 build runs on Colab's R580 driver (CUDA up to 13.0);
+# don't pick a 13.x build newer than the driver supports.
+LLAMA_CPP_BUILD = "b12359"
+LLAMA_CPP_CUDA = "12.8"
 
 # Default factual questions asked of every page. Keys become JSON keys in the
 # `answers_json` column, so keep them short and stable.
@@ -70,9 +74,11 @@ class ScanConfig:
     max_new_tokens: int = 3072
     ctx_size: int = 8192
 
-    # llama.cpp server. The compiled binary is cached under `cache_dir` on Drive,
-    # so only the first session on each GPU type pays for the build.
-    llama_cpp_ref: str = LLAMA_CPP_REF
+    # llama.cpp server, downloaded prebuilt each session (about 800 MB). On a T4
+    # the GPU driver compiles its kernels on first use; that result is cached
+    # under `cache_dir` on Drive.
+    llama_cpp_build: str = LLAMA_CPP_BUILD
+    llama_cpp_cuda: str = LLAMA_CPP_CUDA
     cache_dir: str = "/content/drive/MyDrive/pile-scan/cache"
     # Model files are downloaded here each session (fast inside Google's network).
     model_dir: str = "/content/models"

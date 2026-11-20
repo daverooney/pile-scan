@@ -2,11 +2,13 @@
 
 Three jobs, each safe to repeat at the start of every Colab session:
 
-1. `ensure_server_binary`: build `llama-server` with CUDA once per GPU type and
-   llama.cpp version, and cache the binary on Drive. Later sessions copy it
-   back in seconds.
-2. `ensure_model_files`: download the GGUF model and its vision projector.
-3. `LlamaServer` and `LlamaPageReader`: start the server, then send it one page
+1. `check_environment` and `ensure_server_binary`: confirm the runtime can run
+   llama.cpp's prebuilt CUDA build, then download and unpack it (no compiling).
+   `verify_server` then confirms it can actually see the GPU.
+2. `JitCache`: the prebuilt build has no ready-made T4 code, so the GPU driver
+   compiles it on first use. The result is saved to Drive so this happens once.
+3. `ensure_model_files`: download the GGUF model and its vision projector.
+4. `LlamaServer` and `LlamaPageReader`: start the server, then send it one page
    at a time over its OpenAI-style HTTP API.
 
 Server settings that matter for Gemma 4 (checked against llama.cpp v1.0.0's
@@ -27,122 +29,305 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
+import tarfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .config import ScanConfig
 from .reader import ReadResult
 
-LLAMA_CPP_GIT = "https://github.com/ggml-org/llama.cpp"
 BATCH_SIZE = 2048
+RELEASES = "https://github.com/ggml-org/llama.cpp/releases/download"
+
+# The prebuilt Linux CUDA builds are compiled on Ubuntu 24.04 and need glibc
+# 2.38 or newer, so they run on Colab's 2026.10 runtime but not on the older
+# Ubuntu 22.04 runtimes (glibc 2.35).
+MIN_GLIBC = (2, 38)
+# A CUDA 12.8 build needs an R570 or newer driver. Colab's T4s report 580.
+MIN_DRIVER = 570
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
+class EnvironmentProblem(RuntimeError):
+    """The Colab runtime can't run the prebuilt server. The message says how to fix it."""
+
+
 def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=True, **kw)
+    kw.setdefault("check", True)
+    return subprocess.run(cmd, **kw)
 
 
-# --- building and caching the server -----------------------------------------
+# --- checking the runtime ------------------------------------------------------
 
-def cuda_arch(runner: Runner = _run) -> str:
-    """Compute capability of GPU 0 as CMake wants it: "75" for a T4, "89" for an L4."""
-    out = runner(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                 capture_output=True, text=True).stdout
-    first = out.strip().splitlines()[0].strip()
-    return first.replace(".", "")
+@dataclass
+class GpuInfo:
+    name: str
+    driver: str
+    compute_cap: str     # "7.5" for a T4, "8.9" for an L4
+    memory_mib: int
+
+    @property
+    def needs_jit(self) -> bool:
+        """True when the prebuilt build has no native code for this GPU.
+
+        The CUDA 12.8 release ships native code for compute 8.6, 8.9 and 12.0
+        and PTX for the rest (llama.cpp's default architecture list in
+        ggml/src/ggml-cuda/CMakeLists.txt), so a T4 (7.5) needs the driver to
+        compile kernels on first use.
+        """
+        return self.compute_cap.replace(".", "") not in ("86", "89", "120")
 
 
-def build_commands(src: Path, build: Path, arch: str, jobs: int) -> list[list[str]]:
+def glibc_version() -> tuple[int, int]:
+    try:
+        name, ver = os.confstr("CS_GNU_LIBC_VERSION").split()
+        major, minor = ver.split(".")[:2]
+        return int(major), int(minor)
+    except (ValueError, OSError, AttributeError):
+        return (0, 0)
+
+
+def gpu_info(runner: Runner = _run) -> GpuInfo | None:
+    try:
+        out = runner(["nvidia-smi", "--query-gpu=name,driver_version,compute_cap,memory.total",
+                      "--format=csv,noheader,nounits"], capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    line = out.strip().splitlines()[0]
+    name, driver, cap, mem = (x.strip() for x in line.split(","))
+    return GpuInfo(name=name, driver=driver, compute_cap=cap, memory_mib=int(float(mem)))
+
+
+def check_environment(cfg: ScanConfig, *, runner: Runner = _run, glibc: tuple[int, int] | None = None,
+                      log=print) -> GpuInfo:
+    """Fail early, with a fix, if this runtime can't run the prebuilt server."""
+    glibc = glibc or glibc_version()
+    if glibc < MIN_GLIBC:
+        raise EnvironmentProblem(
+            f"This Colab runtime has glibc {glibc[0]}.{glibc[1]}, but llama.cpp's prebuilt CUDA build "
+            f"needs {MIN_GLIBC[0]}.{MIN_GLIBC[1]} or newer (Ubuntu 24.04). Fix: Runtime > Change runtime "
+            "type > Runtime version > Latest (2026.10 or newer), then Run all again."
+        )
+    gpu = gpu_info(runner)
+    if gpu is None:
+        raise EnvironmentProblem("No GPU found. Runtime > Change runtime type > pick a GPU (T4 or L4), "
+                                 "then Run all again.")
+    try:
+        driver_major = int(gpu.driver.split(".")[0])
+    except ValueError:
+        driver_major = 0
+    if driver_major < MIN_DRIVER:
+        raise EnvironmentProblem(
+            f"GPU driver {gpu.driver} is too old for the CUDA {cfg.llama_cpp_cuda} build "
+            f"(needs {MIN_DRIVER} or newer). Switch to the latest runtime version."
+        )
+    # File sizes in GiB, plus about 3.5 GiB for the vision projector, KV cache
+    # and the 2048-token compute buffers.
+    weights_gib = {"4bit": 6.9, "8bit": 11.8}.get(cfg.quantization)
+    if weights_gib and weights_gib + 3.5 > gpu.memory_mib / 1024:
+        log(f"Warning: {cfg.quantization} may not fit on this {gpu.name} "
+            f"({gpu.memory_mib / 1024:.0f} GiB). If the server runs out of memory, use 4bit or an L4.")
+    log(f"Runtime OK: glibc {glibc[0]}.{glibc[1]}, {gpu.name} ({gpu.memory_mib} MiB), "
+        f"driver {gpu.driver}, compute {gpu.compute_cap}.")
+    return gpu
+
+
+# --- getting the prebuilt server -------------------------------------------------
+
+def release_assets(build: str, cuda: str) -> list[str]:
+    """URLs of the server tarball and the CUDA runtime libraries it links against."""
     return [
-        ["cmake", "-S", str(src), "-B", str(build),
-         "-DCMAKE_BUILD_TYPE=Release",
-         "-DGGML_CUDA=ON",
-         f"-DCMAKE_CUDA_ARCHITECTURES={arch}",   # only this GPU: much faster to compile
-         "-DBUILD_SHARED_LIBS=OFF",              # one self-contained binary to cache
-         "-DLLAMA_OPENSSL=OFF",                  # we download models ourselves
-         "-DLLAMA_BUILD_TESTS=OFF",
-         "-DLLAMA_BUILD_EXAMPLES=OFF"],
-        ["cmake", "--build", str(build), "--config", "Release", "-j", str(jobs), "--target", "llama-server"],
+        f"{RELEASES}/{build}/llama-{build}-bin-ubuntu-cuda-{cuda}-x64.tar.gz",
+        f"{RELEASES}/{build}/cudart-llama-{build}-bin-ubuntu-cuda-{cuda}-x64.tar.gz",
     ]
 
 
-def cache_entry(cache_dir: str | Path, ref: str, arch: str) -> Path:
-    return Path(cache_dir) / "llama.cpp" / f"{ref}-sm{arch}"
+def _extract_flat(archive: Path, dest: Path) -> None:
+    """Unpack a release tarball's files directly into `dest` (dropping its top folder).
 
-
-def _binary_works(binary: Path, runner: Runner) -> bool:
-    try:
-        runner([str(binary), "--version"], capture_output=True, text=True, timeout=60)
-        return True
-    except Exception:
-        return False
-
-
-def ensure_server_binary(cfg: ScanConfig, *, rebuild: bool = False, log=print,
-                         runner: Runner = _run, arch: str | None = None) -> Path:
-    """Return a path to a working llama-server on local disk.
-
-    Reuses the copy cached on Drive when there is one for this llama.cpp
-    version and GPU type; otherwise builds it (slow, once) and caches it.
+    The server finds its libraries next to itself (RUNPATH $ORIGIN), so the
+    CUDA runtime tarball is unpacked into the same folder.
     """
-    arch = arch or cuda_arch(runner)
-    entry = cache_entry(cfg.cache_dir, cfg.llama_cpp_ref, arch)
-    cached = entry / "llama-server"
-    local_bin = Path(cfg.local_dir) / "bin" / "llama-server"
-    local_bin.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive) as tf:
+        for member in tf.getmembers():
+            if not (member.isfile() or member.islnk() or member.issym()):
+                continue
+            name = Path(member.name).name
+            if not name or name in (".", ".."):
+                continue
+            target = dest / name
+            if member.issym():
+                link = Path(member.linkname).name
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                target.symlink_to(link)
+                continue
+            src = tf.extractfile(member)   # follows hard links too
+            if target.exists() or target.is_symlink():
+                target.unlink()
+            with open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
+            target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
-    if cached.exists() and not rebuild:
-        shutil.copyfile(cached, local_bin)   # Drive doesn't keep the executable bit
-        local_bin.chmod(0o755)
-        if _binary_works(local_bin, runner):
-            log(f"Using cached llama-server ({cfg.llama_cpp_ref}, sm{arch}) from {entry}")
-            return local_bin
-        log("Cached llama-server didn't run; rebuilding.")
 
-    src = Path(cfg.local_dir) / "llama.cpp-src"
-    build = src / "build"
-    if src.exists():
-        shutil.rmtree(src)
-    # Colab ships the CUDA toolkit in /usr/local/cuda but doesn't always put
-    # nvcc on PATH; CMake finds it through CUDACXX.
-    if shutil.which("nvcc") is None and Path("/usr/local/cuda/bin/nvcc").exists():
-        os.environ.setdefault("CUDACXX", "/usr/local/cuda/bin/nvcc")
-    log(f"Building llama-server {cfg.llama_cpp_ref} for sm{arch}. This happens once per GPU type "
-        "and llama.cpp version, and takes a while.")
+def ensure_server_binary(cfg: ScanConfig, *, log=print, download=None) -> Path:
+    """Download and unpack llama.cpp's prebuilt CUDA server. Returns the llama-server path.
+
+    Skips the download if this VM already has it unpacked.
+    """
+    download = download or _download
+    dest = Path(cfg.local_dir) / f"llama-{cfg.llama_cpp_build}-cuda-{cfg.llama_cpp_cuda}"
+    server = dest / "llama-server"
+    marker = dest / ".complete"
+    if marker.exists() and server.exists():
+        return server
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    downloads = Path(cfg.local_dir) / "downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    runner(["git", "clone", "--depth", "1", "--branch", cfg.llama_cpp_ref, LLAMA_CPP_GIT, str(src)])
-    for cmd in build_commands(src, build, arch, os.cpu_count() or 2):
-        runner(cmd)
-    built = build / "bin" / "llama-server"
-    if not built.exists():
-        raise RuntimeError(f"Build finished but {built} is missing.")
-    commit = runner(["git", "-C", str(src), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    log(f"Built in {(time.time() - t0) / 60:.1f} min.")
+    for url in release_assets(cfg.llama_cpp_build, cfg.llama_cpp_cuda):
+        archive = downloads / url.rsplit("/", 1)[1]
+        if not archive.exists():
+            log(f"Downloading {archive.name}")
+            download(url, archive, log=log)
+        _extract_flat(archive, dest)
+        archive.unlink()
+    if not server.exists():
+        raise RuntimeError(f"{server} missing after unpacking the llama.cpp release.")
+    marker.write_text(cfg.llama_cpp_build)
+    log(f"llama.cpp {cfg.llama_cpp_build} (CUDA {cfg.llama_cpp_cuda}) ready in {time.time() - t0:.0f}s")
+    return server
 
-    shutil.copyfile(built, local_bin)
-    local_bin.chmod(0o755)
 
-    # Cache on Drive: write under a temporary name, then rename, so a session
-    # killed mid-copy never leaves a half-written binary that looks complete.
-    entry.mkdir(parents=True, exist_ok=True)
-    tmp = entry / f"llama-server.tmp-{os.getpid()}"
-    shutil.copyfile(built, tmp)
-    os.replace(tmp, cached)
-    (entry / "build-info.json").write_text(json.dumps({
-        "ref": cfg.llama_cpp_ref, "commit": commit, "cuda_arch": arch,
-        "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "build_minutes": round((time.time() - t0) / 60, 1),
-    }, indent=2))
-    log(f"Cached llama-server at {cached}")
-    shutil.rmtree(src, ignore_errors=True)
-    return local_bin
+def verify_server(binary: Path, *, env: dict | None = None, runner: Runner = _run) -> str:
+    """Run `llama-server --list-devices` and make sure it sees a CUDA GPU.
+
+    The prebuilt build loads its CUDA backend at run time; if that fails (a
+    missing library, a driver mismatch) it quietly falls back to the CPU, which
+    would be unusably slow. This turns that into a clear error.
+    """
+    try:
+        res = runner([str(binary), "--list-devices"], capture_output=True, text=True,
+                     env=env, timeout=600, check=False)
+    except OSError as exc:
+        raise EnvironmentProblem(f"Could not run {binary}: {exc}") from None
+    text = (res.stdout or "") + (res.stderr or "")
+    if "GLIBC_" in text and "not found" in text:
+        raise EnvironmentProblem(
+            "llama-server needs a newer glibc than this runtime has. Runtime > Change runtime type > "
+            "Runtime version > Latest, then Run all again.\n" + text.strip()[-500:])
+    cuda_lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("CUDA")]
+    if res.returncode != 0 or not cuda_lines:
+        hint = _missing_libraries(binary.parent / "libggml-cuda.so", runner)
+        raise EnvironmentProblem(
+            "llama-server can't see the GPU, so it would run on the CPU." + hint +
+            "\nOutput of --list-devices:\n" + text.strip()[-1000:])
+    return cuda_lines[0]
+
+
+def _missing_libraries(lib: Path, runner: Runner) -> str:
+    try:
+        out = runner(["ldd", str(lib)], capture_output=True, text=True, check=False).stdout
+    except OSError:
+        return ""
+    missing = [ln.split("=>")[0].strip() for ln in out.splitlines() if "not found" in ln]
+    return f" Missing libraries: {', '.join(missing)}." if missing else ""
+
+
+# --- the T4's first-launch GPU code cache -------------------------------------------
+
+class JitCache:
+    """Keeps the CUDA driver's compiled-kernel cache on Drive between sessions.
+
+    On a GPU the prebuilt build has no native code for (the T4), the driver
+    compiles each kernel from PTX the first time it's used and stores the
+    result in CUDA_CACHE_PATH. That folder lives on local disk while the server
+    runs (reading it over the Drive mount would be slow) and is saved to Drive
+    as one tar file. The cache is specific to the GPU model, driver and
+    llama.cpp build, so all three are in the file name.
+    """
+
+    def __init__(self, cfg: ScanConfig, gpu: GpuInfo, *, log=print):
+        slug = re.sub(r"[^A-Za-z0-9.]+", "-", f"{gpu.name}-{gpu.driver}").strip("-")
+        self.local = Path(cfg.local_dir) / "cuda-jit-cache"
+        self.drive_file = (Path(cfg.cache_dir) / "cuda-jit" /
+                           f"{cfg.llama_cpp_build}-cuda{cfg.llama_cpp_cuda}-{slug}.tar")
+        self.log = log
+        self._saved_signature: tuple[int, int] | None = None
+
+    def env(self) -> dict[str, str]:
+        """Environment variables for the server process."""
+        return {
+            **os.environ,
+            "CUDA_CACHE_PATH": str(self.local),
+            "CUDA_CACHE_MAXSIZE": str(4 * 1024 ** 3),   # the maximum; the default 256 MiB is too small
+            "CUDA_CACHE_DISABLE": "0",
+        }
+
+    def _signature(self) -> tuple[int, int]:
+        files = [p for p in self.local.rglob("*") if p.is_file()] if self.local.exists() else []
+        return len(files), sum(p.stat().st_size for p in files)
+
+    def restore(self) -> bool:
+        self.local.mkdir(parents=True, exist_ok=True)
+        if not self.drive_file.exists():
+            return False
+        try:
+            with tarfile.open(self.drive_file) as tf:
+                for member in tf.getmembers():
+                    rel = Path(member.name)
+                    if not member.isfile() or rel.is_absolute() or ".." in rel.parts:
+                        continue
+                    target = self.local / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with tf.extractfile(member) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+        except (tarfile.TarError, OSError) as exc:
+            self.log(f"Couldn't read the saved GPU code ({exc}); it will be compiled again.")
+            return False
+        self._saved_signature = self._signature()
+        self.log(f"Restored compiled GPU code from {self.drive_file.name} "
+                 f"({self._saved_signature[1] / 1e6:.0f} MB)")
+        return True
+
+    def save(self) -> bool:
+        """Copy the cache to Drive if it changed since the last save. Returns True if saved.
+
+        Cheap when nothing changed, so it's called after every page: on a T4
+        the first few pages compile new kernels, then the cache stops growing.
+        Never raises; a failed save only means compiling again next session.
+        """
+        try:
+            return self._save()
+        except OSError as exc:
+            self.log(f"Couldn't save compiled GPU code to Drive: {exc}")
+            return False
+
+    def _save(self) -> bool:
+        sig = self._signature()
+        if sig[0] == 0 or sig == self._saved_signature:
+            return False
+        self.drive_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.drive_file.with_name(f"{self.drive_file.name}.tmp-{os.getpid()}")
+        with tarfile.open(tmp, "w") as tf:
+            for p in sorted(self.local.rglob("*")):
+                if p.is_file():
+                    tf.add(p, arcname=str(p.relative_to(self.local)))
+        os.replace(tmp, self.drive_file)
+        self._saved_signature = sig
+        self.log(f"Saved compiled GPU code to Drive ({sig[1] / 1e6:.0f} MB)")
+        return True
 
 
 # --- model files -------------------------------------------------------------
@@ -227,8 +412,10 @@ def server_args(binary: Path, model: Path, mmproj: Path, cfg: ScanConfig) -> lis
 class LlamaServer:
     """Starts llama-server as a child process and waits until it's ready."""
 
-    def __init__(self, args: list[str], *, port: int, log_path: Path, log=print):
+    def __init__(self, args: list[str], *, port: int, log_path: Path, log=print,
+                 env: dict[str, str] | None = None):
         self.args = args
+        self.env = env   # e.g. JitCache.env(), so compiled GPU code lands in the cache
         self.port = port
         self.log_path = log_path
         self.log = log
@@ -238,11 +425,12 @@ class LlamaServer:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def start(self, *, timeout: float = 900) -> "LlamaServer":
+    def start(self, *, timeout: float = 1800) -> "LlamaServer":
         self.stop()
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_fh = open(self.log_path, "ab")
-        self.proc = subprocess.Popen(self.args, stdout=self._log_fh, stderr=subprocess.STDOUT)
+        self.proc = subprocess.Popen(self.args, stdout=self._log_fh, stderr=subprocess.STDOUT,
+                                     env=self.env)
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self.proc.poll() is not None:
@@ -295,11 +483,15 @@ def _png_data_uri(image) -> str:
 class LlamaPageReader:
     """Sends one page image + prompt to llama-server and returns the raw reply."""
 
-    def __init__(self, server: LlamaServer, cfg: ScanConfig, *, request_timeout: float = 1800, log=print):
+    def __init__(self, server: LlamaServer, cfg: ScanConfig, *, request_timeout: float = 1800, log=print,
+                 after_read: Callable[[], object] | None = None):
         self.server = server
         self.cfg = cfg
         self.timeout = request_timeout
         self.log = log
+        # Called after each page, e.g. JitCache.save, so kernels the T4 compiled
+        # for that page reach Drive even if the session dies later.
+        self.after_read = after_read
         self._text_only_tokens: dict[str, int] = {}
 
     def _post(self, payload: dict) -> dict:
@@ -346,11 +538,14 @@ class LlamaPageReader:
         prompt_tokens = usage.get("prompt_tokens")
         base = self._baseline_tokens(prompt)
         image_tokens = prompt_tokens - base if (prompt_tokens is not None and base is not None) else None
+        elapsed = time.time() - t0
+        if self.after_read is not None:
+            self.after_read()
         return ReadResult(
             raw=raw,
             output_tokens=int(usage.get("completion_tokens") or 0),
             image_soft_tokens=image_tokens,
-            elapsed_s=time.time() - t0,
+            elapsed_s=elapsed,
             truncated=choice.get("finish_reason") == "length",
         )
 
