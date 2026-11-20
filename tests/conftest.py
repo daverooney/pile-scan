@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pile_scan.config import ScanConfig  # noqa: E402
-from pile_scan.model import ReadResult  # noqa: E402
+from pile_scan.reader import ReadResult  # noqa: E402
 
 
 def make_page(text: str, size=(850, 1100)) -> Image.Image:

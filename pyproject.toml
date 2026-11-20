@@ -14,17 +14,19 @@ dependencies = [
     "pypdfium2>=4.30",
 ]
 
-[project.optional-dependencies]
-# Installed in Colab only. The GPU stack (torch) comes preinstalled there.
-gpu = [
-    "transformers>=5.15",
-    "accelerate>=1.0",
-    "bitsandbytes>=0.45",
-]
-test = ["pytest>=8"]
+# The model runs in llama.cpp's own server (built in the notebook), so there
+# are no Python ML dependencies.
+
+[dependency-groups]
+dev = ["pytest>=8"]
 
 [tool.setuptools]
 packages = ["pile_scan"]
+
+[tool.uv]
+# Colab installs into its system Python, so keep the lock usable on any
+# Python version Colab might be running.
+required-version = ">=0.5"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

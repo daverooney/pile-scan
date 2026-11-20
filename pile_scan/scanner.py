@@ -6,14 +6,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
-
 from . import checkpoint, db, extract, files
 from .config import ScanConfig
-
-
-class PageReader(Protocol):
-    def read(self, image, prompt: str) -> Any: ...  # returns model.ReadResult
+from .reader import PageReader
 
 
 @dataclass
@@ -55,7 +50,7 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
     run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     summary = ScanSummary(run_id=run_id)
     if reader is not None:
-        db.start_run(conn, run_id, model_id=cfg.model_id, quantization=cfg.quantization,
+        db.start_run(conn, run_id, model_id=cfg.model_label, quantization=cfg.quantization,
                      max_soft_tokens=cfg.max_soft_tokens, gpu_name=gpu_name, settings_json=cfg.to_json())
 
     prompt = extract.build_prompt(cfg.questions)
@@ -122,7 +117,7 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
                         "pdf_text_layer": page.text_layer,
                         "image_width": page.image.width,
                         "image_height": page.image.height,
-                        "model_id": cfg.model_id,
+                        "model_id": cfg.model_label,
                         "quantization": cfg.quantization,
                         "max_soft_tokens": cfg.max_soft_tokens,
                         "prompt_version": extract.PROMPT_VERSION,
@@ -131,7 +126,7 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
                     try:
                         result = reader.read(page.image, prompt)
                         values = extract.parse_response(result.raw)
-                        values["truncated"] = int(values["truncated"] or result.output_tokens >= cfg.max_new_tokens)
+                        values["truncated"] = int(bool(values["truncated"] or result.truncated))
                         values.update(base, status="done", elapsed_s=result.elapsed_s,
                                       output_tokens=result.output_tokens,
                                       image_soft_tokens=result.image_soft_tokens, error=None)
@@ -147,10 +142,10 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
                         log(f"[{summary.pages_read}] {label} · {result.elapsed_s:.1f}s · "
                             f"{result.output_tokens} tok · {_short(values['doc_title'], 40)}{flag}")
                     except Exception as exc:
-                        from .model import is_oom
-
-                        if is_oom(exc) and hasattr(reader, "free_cache"):
-                            reader.free_cache()
+                        # e.g. the server ran out of GPU memory and exited: let the
+                        # reader bring it back before the next page.
+                        if hasattr(reader, "recover"):
+                            reader.recover()
                         db.save_page(conn, sha, page.index, {
                             **base, "status": "error", "error": f"{type(exc).__name__}: {exc}"[:2000],
                         })
