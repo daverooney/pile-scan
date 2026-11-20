@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS pages (
     truncated           INTEGER NOT NULL DEFAULT 0,-- 1 if the reply was cut off (token limit or a loop)
     loop_detected       INTEGER NOT NULL DEFAULT 0,-- 1 if a reading of this page got stuck repeating itself
     retry_mode          TEXT,                      -- how the page was re-read: 'dry' (loop) or 'longer'
+    strips_json         TEXT,                      -- when read in strips: each strip's cut, heading band and reply
     -- Ordering clues for the sorting pass.
     doc_title           TEXT,
     doc_type            TEXT,
@@ -122,7 +123,7 @@ CREATE INDEX IF NOT EXISTS pages_by_date ON pages(primary_date);
 """
 
 PAGE_COLUMNS = (
-    "status", "ocr_text", "pdf_text_layer", "truncated", "loop_detected", "retry_mode",
+    "status", "ocr_text", "pdf_text_layer", "truncated", "loop_detected", "retry_mode", "strips_json",
     "doc_title", "doc_type", "page_number_printed", "page_number_int", "page_total_int",
     "dates_json", "primary_date", "first_line", "last_line", "running_header",
     "running_footer", "starts_mid_sentence", "ends_mid_sentence", "language",
@@ -171,6 +172,10 @@ def _migrate(conn: sqlite3.Connection, version: int) -> None:
             conn.execute("ALTER TABLE pages ADD COLUMN loop_detected INTEGER NOT NULL DEFAULT 0")
         if "retry_mode" not in cols:
             conn.execute("ALTER TABLE pages ADD COLUMN retry_mode TEXT")
+    if version < 3:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(pages)")}
+        if "strips_json" not in cols:
+            conn.execute("ALTER TABLE pages ADD COLUMN strips_json TEXT")
     conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
 
 

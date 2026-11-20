@@ -130,6 +130,7 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
                         values["truncated"] = int(bool(values["truncated"] or result.truncated))
                         values.update(base, status="truncated" if values["truncated"] else "done",
                                       loop_detected=int(result.loop_detected), retry_mode=result.retry_mode,
+                                      strips_json=getattr(result, "strips_json", None),
                                       elapsed_s=result.elapsed_s,
                                       output_tokens=result.output_tokens,
                                       image_soft_tokens=result.image_soft_tokens, error=None)

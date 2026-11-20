@@ -21,7 +21,7 @@ from typing import Any
 
 # Bump when the prompt changes in a way that affects results. Stored per page,
 # so later notebooks can tell which pages were read with which prompt.
-PROMPT_VERSION = 3   # 2: tables as one line per filled row; 3: [?] for unclear marks, strips
+PROMPT_VERSION = 4   # 2: tables as one line per filled row; 3: [?] for unclear marks, strips; 4: heading band on strips
 
 META_FIELDS = {
     "doc_title": "The document's title or subject line as printed, or a short description if none is printed.",
@@ -97,18 +97,25 @@ def build_meta_prompt(questions: dict[str, str]) -> str:
     )
 
 
-def build_strip_prompt(part: int, parts: int) -> str:
+def build_strip_prompt(part: int, parts: int, heading: bool = False) -> str:
     """When a page is read in strips: the text of one horizontal strip.
 
     Sent with two images, the whole page and then the strip, so the model can
-    see column headings that are outside the strip.
+    see column headings that are outside the strip. With `heading`, the
+    table's heading band has been pasted above the strip, under a grey bar.
     """
+    head = ("" if not heading else
+            "Above the grey bar at the top of the close-up is a copy of the table's column headings "
+            "from higher up the page, so you can see which column is which. Do not transcribe that "
+            "copy; transcribe only what is below the grey bar, and use the headings above it to name "
+            "the column each mark sits in.\n\n")
     return (
         "You are transcribing one scanned page in parts. The first image is the whole page. The "
         f"second image is a close-up of part {part} of {parts}, a horizontal strip of the same page "
         "(part 1 is the top). Transcribe only what is in the close-up, using the whole page to see "
         "column headings and context that are outside it.\n\n"
-        "Reply with only the transcription inside <text></text> tags. " + TEXT_RULES + "\n\n"
+        + head
+        + "Reply with only the transcription inside <text></text> tags. " + TEXT_RULES + "\n\n"
         + TABLE_RULES
     )
 
@@ -126,6 +133,45 @@ def meta_section(raw: str) -> str:
     """Just the <meta>...</meta> block of a reply, closed even if the reply was cut off."""
     m = _META_RE.search(clean_response(raw))
     return f"<meta>{m.group(1).strip() if m else '{}'}</meta>"
+
+
+_SQUASH = re.compile(r"[\s|]+")
+
+
+def _squash(line: str) -> str:
+    return _SQUASH.sub("", line).lower()
+
+
+def join_strips(texts: list[str], window: int = 10) -> tuple[str, list[list[str]]]:
+    """Join the strips' transcriptions, dropping lines a strip repeats from the one above.
+
+    Where two strips meet, the model sometimes writes the same line in both
+    (a row near the cut, or one it read off the whole page). A line among the
+    first `window` lines of a strip is dropped when it is the same as, or is
+    contained in or contains, one of the last `window` lines written so far,
+    ignoring spacing and "|". Nearly-the-same lines are kept: two table rows
+    can differ only in their row number. Short lines (under 8 characters) are
+    never dropped, so row numbers and the like stay. Returns the text and the lines dropped from
+    each strip.
+    """
+    out: list[str] = []
+    dropped: list[list[str]] = []
+    for k, text in enumerate(texts):
+        lines = [ln for ln in text.split("\n")] if text else []
+        gone: list[str] = []
+        if k and out:
+            tail = [_squash(ln) for ln in out[-window:] if len(_squash(ln)) >= 8]
+            kept = []
+            for n, line in enumerate(lines):
+                sq = _squash(line)
+                if n < window and len(sq) >= 8 and any(sq in t or t in sq for t in tail):
+                    gone.append(line)
+                else:
+                    kept.append(line)
+            lines = kept
+        dropped.append(gone)
+        out.extend(lines)
+    return "\n".join(out).strip(), dropped
 
 
 # --- tidying tables ---------------------------------------------------------------

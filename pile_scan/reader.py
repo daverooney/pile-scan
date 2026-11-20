@@ -15,6 +15,7 @@ class ReadResult:
     truncated: bool = False          # cut off at the token limit, or stopped in a loop
     loop_detected: bool = False      # a reading got stuck repeating itself
     retry_mode: str | None = None    # "dry" or "longer" if the page was read a second time
+    strips_json: str | None = None   # per-strip cuts and replies, when read in strips
 
 
 class PageReader(Protocol):

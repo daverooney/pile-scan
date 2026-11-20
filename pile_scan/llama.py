@@ -792,21 +792,24 @@ class LlamaPageReader:
         """Metadata from the whole page, text from horizontal strips (see strips.py).
 
         Each strip is sent with the whole page first, so the model can see
-        column headings that are above the strip. The pieces are put back
-        together as one reply in the usual <meta> + <text> format.
+        column headings that are above the strip; strips inside a ruled table
+        also get the table's heading band pasted on top. The pieces are put
+        back together as one reply in the usual <meta> + <text> format, and
+        each strip's cut and reply are kept in `strips_json`.
         """
         whole = {"type": "image_url", "image_url": {"url": _png_data_uri(image)}}
         meta_prompt = extract.build_meta_prompt(self.cfg.questions)
         meta_final, all_attempts, meta_retry = self._read_with_retry(
             [whole, {"type": "text", "text": meta_prompt}], 1024, 2048)
         image_tokens = self._image_tokens(all_attempts, meta_prompt)
-        pieces = strips.split(image, self.cfg.strips)
+        pieces = strips.make_strips(image, self.cfg.strips)
         texts: list[str] = []
+        records: list[dict] = []
         truncated = meta_final.cut_off
         modes = {meta_retry} - {None}
-        for k, piece in enumerate(pieces, start=1):
-            prompt = extract.build_strip_prompt(k, len(pieces))
-            content = [whole, {"type": "image_url", "image_url": {"url": _png_data_uri(piece)}},
+        for piece in pieces:
+            prompt = extract.build_strip_prompt(piece.part, len(pieces), heading=piece.heading is not None)
+            content = [whole, {"type": "image_url", "image_url": {"url": _png_data_uri(piece.image)}},
                        {"type": "text", "text": prompt}]
             final, attempts, mode = self._read_with_retry(
                 content, self.cfg.max_new_tokens, self.cfg.retry_max_new_tokens)
@@ -816,8 +819,15 @@ class LlamaPageReader:
             text, closed = extract.text_section(final.kept_text)
             texts.append(text)
             truncated = truncated or final.cut_off or not closed
+            records.append({**piece.record(), "reply": final.kept_text,
+                            "truncated": final.cut_off or not closed,
+                            "loop": any(a.loop_at is not None for a in attempts), "retry_mode": mode,
+                            "output_tokens": sum(a.completion_tokens for a in attempts)})
+        joined, dropped = extract.join_strips(texts)
+        for rec, gone in zip(records, dropped):
+            rec["dropped_lines"] = gone
         meta = extract.meta_section(meta_final.kept_text)
-        raw = f"{meta}\n<text>\n" + "\n".join(t for t in texts if t) + ("" if truncated else "\n</text>")
+        raw = f"{meta}\n<text>\n{joined}" + ("" if truncated else "\n</text>")
         return ReadResult(
             raw=raw,
             output_tokens=sum(a.completion_tokens for a in all_attempts),
@@ -826,6 +836,8 @@ class LlamaPageReader:
             truncated=truncated,
             loop_detected=any(a.loop_at is not None for a in all_attempts),
             retry_mode="dry" if "dry" in modes else ("longer" if modes else None),
+            strips_json=json.dumps({"meta_reply": meta_final.kept_text, "strips": records},
+                                   ensure_ascii=False),
         )
 
     def recover(self) -> None:

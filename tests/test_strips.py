@@ -1,5 +1,6 @@
 """Reading pages in strips, prompt v3, and tidying table rows."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -53,10 +54,11 @@ def test_one_strip_means_no_cut():
 
 def test_prompt_v3_rules():
     p = extract.build_prompt({})
-    assert extract.PROMPT_VERSION == 3
+    assert extract.PROMPT_VERSION >= 3
     assert "[?]" in p and "never draw borders" in p and "ordinary lines" in p
     strip = extract.build_strip_prompt(2, 3)
     assert "part 2 of 3" in strip and "first image is the whole page" in strip and "[?]" in strip
+    assert "grey bar" not in strip and "grey bar" in extract.build_strip_prompt(3, 3, heading=True)
     meta = extract.build_meta_prompt({"who": "who filed it"})
     assert "<meta>" in meta and '"who"' in meta and "<text>" not in meta
 
@@ -112,3 +114,101 @@ def test_strip_that_loops_is_retried_on_its_own(tmp_path):
         server.stop()
     # The meta read loops first (the fake loops on the first image request) and is retried with DRY.
     assert len(sent(rec)) == 4 and res.loop_detected and res.retry_mode == "dry" and not res.truncated
+
+
+def ruled_form():
+    """A landscape form: title text, a tall heading band, then 12 even rows with an X in each."""
+    img = Image.new("RGB", (1200, 900), "white")
+    d = ImageDraw.Draw(img)
+    for y in range(20, 120, 16):
+        d.text((30, y), "Report any purchase, sale, or exchange of securities", fill="black")
+    rules = [140, 300] + list(range(345, 880, 45))
+    for y in rules:
+        d.line([(20, y), (1180, y)], fill="black", width=2)
+    for x in range(400, 1181, 60):
+        d.line([(x, 140), (x, rules[-1])], fill="black", width=1)
+    for x in range(410, 1181, 60):
+        d.text((x, 200), "$1-$2", fill="black")
+    for y in rules[2:-1]:
+        d.text((30, y + 15), "Some asset LLC", fill="black")
+        d.text((470, y + 15), "X", fill="black")
+    return img, rules
+
+
+def test_heading_band_is_pasted_on_strips_inside_the_table():
+    img, rules = ruled_form()
+    pieces = strips.make_strips(img, 3)
+    assert pieces[0].heading is None
+    for piece in pieces[1:]:
+        if piece.top > 300:
+            top, bottom = piece.heading
+            assert abs(top - 140) <= 3 and abs(bottom - 302) <= 3
+            assert piece.image.height == (bottom - top) + strips.BAR + (piece.bottom - piece.top)
+            # The grey bar sits between the copied headings and the strip.
+            assert piece.image.getpixel((5, bottom - top + strips.BAR // 2))[0] == strips.BAR_GREY
+    assert any(p.heading for p in pieces)
+
+
+def test_no_heading_band_on_prose_or_an_even_grid():
+    text = Image.new("RGB", (800, 900), "white")
+    d = ImageDraw.Draw(text)
+    for y in range(10, 890, 14):
+        d.text((10, y), "The quick brown fox jumps over the lazy dog", fill="black")
+    assert all(p.heading is None for p in strips.make_strips(text, 3))
+    grid = form_page()       # rows all the same height: nothing stands out as a heading
+    assert all(p.heading is None for p in strips.make_strips(grid, 3))
+
+
+def test_join_strips_drops_lines_repeated_across_a_cut():
+    first = "Title\nExample: | IBM Corp. (stock) NYSE | Purchase | 2/1/1X\n1"
+    second = ("Example: IBM Corp. (stock) NYSE | Purchase | 2/1/1X | E | X | A\n1\n"
+              "2 | (S) MH Built to Last LLC | Sale | 12/16/25")
+    third = "7 | (S) MH Built to Last LLC | Sale | 12/16/25"
+    text, dropped = extract.join_strips([first, second, third])
+    assert text.split("\n") == ["Title", "Example: | IBM Corp. (stock) NYSE | Purchase | 2/1/1X", "1", "1",
+                                 "2 | (S) MH Built to Last LLC | Sale | 12/16/25",
+                                 "7 | (S) MH Built to Last LLC | Sale | 12/16/25"]
+    assert dropped[1] == ["Example: IBM Corp. (stock) NYSE | Purchase | 2/1/1X | E | X | A"]
+    assert dropped[0] == [] and dropped[2] == []
+
+
+def test_scan_in_strips_saves_each_strip_and_the_notebook_can_show_them(tmp_path):
+    import sqlite3
+    from pile_scan import look
+    from pile_scan.scanner import run_scan
+
+    pile = tmp_path / "inbox"
+    pile.mkdir()
+    form, _ = ruled_form()
+    form.save(pile / "form.png")
+    server, port, rec = start_fake(tmp_path)
+    try:
+        cfg = ScanConfig(input_dir=str(pile), output_dir=str(tmp_path / "drive" / "out"),
+                         local_dir=str(tmp_path / "local"), server_port=port, strips=3)
+        reader = llama.LlamaPageReader(server, cfg, log=lambda *_: None)
+        assert run_scan(cfg, reader, log=lambda *_: None).pages_read == 1
+    finally:
+        server.stop()
+    reqs = sent(rec)
+    assert len(reqs) == 4
+    prompts = [next(c["text"] for c in r["messages"][-1]["content"] if c["type"] == "text") for r in reqs]
+    assert any("grey bar" in p for p in prompts[2:])
+
+    conn = sqlite3.connect(cfg.drive_db_path)
+    stored, text = conn.execute("SELECT strips_json, ocr_text FROM pages").fetchone()
+    saved = json.loads(stored)
+    assert [s["part"] for s in saved["strips"]] == [1, 2, 3]
+    assert all("Hello" in s["reply"] for s in saved["strips"]) and saved["meta_reply"]
+    assert any(s["heading"] for s in saved["strips"])
+    # Lines under 8 characters are never treated as repeats.
+    assert text == "\n".join(["Hello\nWorld"] * 3) and saved["strips"][1]["dropped_lines"] == []
+
+    view = look.page_strips(cfg, "form", 1)
+    assert view.from_database and len(view.strips) == 3
+    assert view.strips[1].reply == saved["strips"][1]["reply"]
+    assert view.strips[2].image.size == next(
+        p.image.size for p in strips.make_strips(form, 3) if p.part == 3)
+    # A page not yet scanned shows how it would be cut.
+    preview = look.page_strips(ScanConfig(input_dir=str(pile), local_dir=str(tmp_path / "x"),
+                                          output_dir=str(tmp_path / "y"), strips=2), "form", 1)
+    assert not preview.from_database and len(preview.strips) == 2 and preview.strips[0].reply is None
