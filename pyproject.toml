@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pile-scan"
+version = "0.1.0"
+description = "Resumable OCR and metadata extraction for piles of scanned pages, built for Google Colab."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=10",
+    "pypdfium2>=4.30",
+]
+
+[project.optional-dependencies]
+# Installed in Colab only. The GPU stack (torch) comes preinstalled there.
+gpu = [
+    "transformers>=5.15",
+    "accelerate>=1.0",
+    "bitsandbytes>=0.45",
+]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["pile_scan"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
