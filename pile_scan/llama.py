@@ -41,12 +41,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .config import ScanConfig
+from . import extract, strips
+from .config import LLAMA_CPP_FALLBACK_BUILD, ScanConfig
 from .loops import find_loop
 from .reader import ReadResult
 
 BATCH_SIZE = 2048
 RELEASES = "https://github.com/ggml-org/llama.cpp/releases/download"
+LATEST_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 
 # The prebuilt Linux CUDA builds are compiled on Ubuntu 24.04 and need glibc
 # 2.38 or newer, so they run on Colab's 2026.10 runtime but not on the older
@@ -180,34 +182,117 @@ def _extract_flat(archive: Path, dest: Path) -> None:
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
-def ensure_server_binary(cfg: ScanConfig, *, log=print, download=None) -> Path:
-    """Download and unpack llama.cpp's prebuilt CUDA server. Returns the llama-server path.
+def _fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json",
+                                               "User-Agent": "pile-scan"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
 
-    Skips the download if this VM already has it unpacked.
+
+def _build_number(build: str) -> int:
+    m = re.fullmatch(r"b(\d+)", build)
+    return int(m.group(1)) if m else -1
+
+
+def release_cache_dir(cfg: ScanConfig, build: str) -> Path:
+    """Where a release's two archives are kept on Drive."""
+    return Path(cfg.cache_dir) / "llama.cpp" / f"{build}-cuda{cfg.llama_cpp_cuda}"
+
+
+def cached_builds(cfg: ScanConfig) -> list[str]:
+    """Builds for this CUDA version that are fully cached on Drive, newest first."""
+    root = Path(cfg.cache_dir) / "llama.cpp"
+    suffix = f"-cuda{cfg.llama_cpp_cuda}"
+    found = []
+    if root.is_dir():
+        for d in root.iterdir():
+            if d.name.endswith(suffix) and (d / ".complete").exists():
+                found.append(d.name[: -len(suffix)])
+    return sorted(found, key=_build_number, reverse=True)
+
+
+def resolve_build(cfg: ScanConfig, *, log=print, fetch_json=None) -> tuple[str, str]:
+    """Which llama.cpp release to use, and why ("pinned", "cached", "newest", "fallback")."""
+    if cfg.llama_cpp_build != "latest":
+        return cfg.llama_cpp_build, "pinned"
+    cached = cached_builds(cfg)
+    if cached:
+        return cached[0], "cached"
+    fetch_json = fetch_json or _fetch_json
+    try:
+        release = fetch_json(LATEST_RELEASE_API)
+        build = release["tag_name"]
+        names = {a.get("name") for a in release.get("assets", [])}
+        wanted = {u.rsplit("/", 1)[1] for u in release_assets(build, cfg.llama_cpp_cuda)}
+        if names and not wanted <= names:
+            log(f"The newest llama.cpp release, {build}, has no CUDA {cfg.llama_cpp_cuda} build yet; "
+                f"using {LLAMA_CPP_FALLBACK_BUILD}.")
+            return LLAMA_CPP_FALLBACK_BUILD, "fallback"
+        return build, "newest"
+    except Exception as exc:   # no network to GitHub's API, rate limit, odd reply
+        log(f"Couldn't look up the newest llama.cpp release ({exc}); using {LLAMA_CPP_FALLBACK_BUILD}.")
+        return LLAMA_CPP_FALLBACK_BUILD, "fallback"
+
+
+def ensure_server_binary(cfg: ScanConfig, *, log=print, download=None, fetch_json=None) -> Path:
+    """Get llama.cpp's prebuilt CUDA server ready on this VM. Returns the llama-server path.
+
+    The release archives are kept on Drive (see `release_cache_dir`), so a new
+    session copies them from there instead of downloading. With the build set
+    to "latest", the cached release is used as is; delete
+    cache_dir/llama.cpp on Drive to move to the newest one.
+
+    Sets `cfg.llama_cpp_build` to the build actually used, so the GPU code
+    cache (JitCache) is named after it.
     """
     download = download or _download
-    dest = Path(cfg.local_dir) / f"llama-{cfg.llama_cpp_build}-cuda-{cfg.llama_cpp_cuda}"
+    build, source = resolve_build(cfg, log=log, fetch_json=fetch_json)
+    cfg.llama_cpp_build = build
+    dest = Path(cfg.local_dir) / f"llama-{build}-cuda-{cfg.llama_cpp_cuda}"
     server = dest / "llama-server"
     marker = dest / ".complete"
+    drive = release_cache_dir(cfg, build)
     if marker.exists() and server.exists():
+        log(f"llama.cpp {build} (CUDA {cfg.llama_cpp_cuda}) already unpacked on this VM.")
         return server
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
-    downloads = Path(cfg.local_dir) / "downloads"
-    downloads.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    for url in release_assets(cfg.llama_cpp_build, cfg.llama_cpp_cuda):
-        archive = downloads / url.rsplit("/", 1)[1]
-        if not archive.exists():
-            log(f"Downloading {archive.name}")
-            download(url, archive, log=log)
+    archives = []
+    if (drive / ".complete").exists():
+        log(f"Using llama.cpp {build} (CUDA {cfg.llama_cpp_cuda}) cached on Drive"
+            + (" (delete the cached folder on Drive to move to the newest release)" if source == "cached" else ""))
+        archives = [drive / u.rsplit("/", 1)[1] for u in release_assets(build, cfg.llama_cpp_cuda)]
+    else:
+        what = {"newest": "the newest release", "pinned": "the pinned release",
+                "fallback": "the fallback release"}.get(source, "")
+        log(f"Downloading llama.cpp {build} (CUDA {cfg.llama_cpp_cuda}), {what}, and caching it on Drive")
+        downloads = Path(cfg.local_dir) / "downloads"
+        downloads.mkdir(parents=True, exist_ok=True)
+        for url in release_assets(build, cfg.llama_cpp_cuda):
+            archive = downloads / url.rsplit("/", 1)[1]
+            if not archive.exists():
+                download(url, archive, log=log)
+            archives.append(archive)
+    for archive in archives:
         _extract_flat(archive, dest)
-        archive.unlink()
     if not server.exists():
         raise RuntimeError(f"{server} missing after unpacking the llama.cpp release.")
-    marker.write_text(cfg.llama_cpp_build)
-    log(f"llama.cpp {cfg.llama_cpp_build} (CUDA {cfg.llama_cpp_cuda}) ready in {time.time() - t0:.0f}s")
+    if not (drive / ".complete").exists():
+        try:
+            drive.mkdir(parents=True, exist_ok=True)
+            for archive in archives:
+                tmp = drive / (archive.name + ".partial")
+                shutil.copyfile(archive, tmp)
+                os.replace(tmp, drive / archive.name)
+            (drive / ".complete").write_text(build)
+        except OSError as exc:
+            log(f"Couldn't cache llama.cpp on Drive ({exc}); the next session will download it again.")
+        for archive in archives:
+            archive.unlink(missing_ok=True)
+    marker.write_text(build)
+    log(f"llama.cpp {build} (CUDA {cfg.llama_cpp_cuda}) ready in {time.time() - t0:.0f}s")
     return server
 
 
@@ -459,8 +544,16 @@ class LlamaServer:
         t0 = time.time()
         while time.time() - t0 < timeout:
             if self.proc.poll() is not None:
+                tail = self.tail()
+                bad = re.search(r"error: invalid argument: (\S+)", tail)
+                if bad:
+                    raise RuntimeError(
+                        f"This llama.cpp build doesn't know the option {bad.group(1)}. It may be too old "
+                        "for that setting (USE_MTP needs a build from June 2026 or later). Delete the "
+                        "llama.cpp folder in the cache folder on Drive to get the newest release, "
+                        "or turn the setting off.\n" + tail)
                 raise RuntimeError(f"llama-server exited with code {self.proc.returncode}. "
-                                   f"Last lines of {self.log_path}:\n{self.tail()}")
+                                   f"Last lines of {self.log_path}:\n{tail}")
             try:
                 with urllib.request.urlopen(f"{self.base_url}/health", timeout=5) as r:
                     if r.status == 200:
@@ -641,40 +734,98 @@ class LlamaPageReader:
                 return None
         return self._text_only_tokens[prompt]
 
-    def read(self, image, prompt: str) -> ReadResult:
-        t0 = time.time()
-        content = [
-            {"type": "image_url", "image_url": {"url": _png_data_uri(image)}},  # image first, per Google
-            {"type": "text", "text": prompt},
-        ]
-        first = self._stream(self._payload(content, self.cfg.max_new_tokens))
+    def _read_with_retry(self, content: list[dict], max_tokens: int, retry_max_tokens: int
+                         ) -> tuple[_Attempt, list[_Attempt], str | None]:
+        """One reading, plus one more if it looped or ran out of tokens.
+
+        Returns the attempt to keep, every attempt made, and the retry mode.
+        """
+        first = self._stream(self._payload(content, max_tokens))
         attempts = [first]
         retry_mode = None
         if first.cut_off and self.retry:
             if first.loop_at is not None:
                 retry_mode = "dry"
-                second = self._stream(self._payload(content, self.cfg.max_new_tokens, **DRY_SETTINGS))
+                second = self._stream(self._payload(content, max_tokens, **DRY_SETTINGS))
             else:
                 retry_mode = "longer"
-                second = self._stream(self._payload(content, self.cfg.retry_max_new_tokens))
+                second = self._stream(self._payload(content, retry_max_tokens))
             attempts.append(second)
         final = attempts[-1]
         if final.cut_off and len(attempts) > 1 and len(first.kept_text) > len(final.kept_text):
             final = first
+        return final, attempts, retry_mode
+
+    def _image_tokens(self, attempts: list[_Attempt], prompt: str, n_images: int = 1) -> int | None:
         prompt_tokens = next((a.prompt_tokens for a in attempts if a.prompt_tokens is not None), None)
         base = self._baseline_tokens(prompt)
-        image_tokens = prompt_tokens - base if (prompt_tokens is not None and base is not None) else None
-        elapsed = time.time() - t0
+        if prompt_tokens is None or base is None:
+            return None
+        return (prompt_tokens - base) // n_images
+
+    def read(self, image, prompt: str) -> ReadResult:
+        t0 = time.time()
+        if self.cfg.strips > 1:
+            result = self._read_in_strips(image)
+        else:
+            content = [
+                {"type": "image_url", "image_url": {"url": _png_data_uri(image)}},  # image first, per Google
+                {"type": "text", "text": prompt},
+            ]
+            final, attempts, retry_mode = self._read_with_retry(
+                content, self.cfg.max_new_tokens, self.cfg.retry_max_new_tokens)
+            result = ReadResult(
+                raw=final.kept_text,
+                output_tokens=sum(a.completion_tokens for a in attempts),
+                image_soft_tokens=self._image_tokens(attempts, prompt),
+                elapsed_s=0.0,
+                truncated=final.cut_off,
+                loop_detected=any(a.loop_at is not None for a in attempts),
+                retry_mode=retry_mode,
+            )
+        result.elapsed_s = time.time() - t0
         if self.after_read is not None:
             self.after_read()
+        return result
+
+    def _read_in_strips(self, image) -> ReadResult:
+        """Metadata from the whole page, text from horizontal strips (see strips.py).
+
+        Each strip is sent with the whole page first, so the model can see
+        column headings that are above the strip. The pieces are put back
+        together as one reply in the usual <meta> + <text> format.
+        """
+        whole = {"type": "image_url", "image_url": {"url": _png_data_uri(image)}}
+        meta_prompt = extract.build_meta_prompt(self.cfg.questions)
+        meta_final, all_attempts, meta_retry = self._read_with_retry(
+            [whole, {"type": "text", "text": meta_prompt}], 1024, 2048)
+        image_tokens = self._image_tokens(all_attempts, meta_prompt)
+        pieces = strips.split(image, self.cfg.strips)
+        texts: list[str] = []
+        truncated = meta_final.cut_off
+        modes = {meta_retry} - {None}
+        for k, piece in enumerate(pieces, start=1):
+            prompt = extract.build_strip_prompt(k, len(pieces))
+            content = [whole, {"type": "image_url", "image_url": {"url": _png_data_uri(piece)}},
+                       {"type": "text", "text": prompt}]
+            final, attempts, mode = self._read_with_retry(
+                content, self.cfg.max_new_tokens, self.cfg.retry_max_new_tokens)
+            all_attempts += attempts
+            if mode:
+                modes.add(mode)
+            text, closed = extract.text_section(final.kept_text)
+            texts.append(text)
+            truncated = truncated or final.cut_off or not closed
+        meta = extract.meta_section(meta_final.kept_text)
+        raw = f"{meta}\n<text>\n" + "\n".join(t for t in texts if t) + ("" if truncated else "\n</text>")
         return ReadResult(
-            raw=final.kept_text,
-            output_tokens=sum(a.completion_tokens for a in attempts),
+            raw=raw,
+            output_tokens=sum(a.completion_tokens for a in all_attempts),
             image_soft_tokens=image_tokens,
-            elapsed_s=elapsed,
-            truncated=final.cut_off,
-            loop_detected=any(a.loop_at is not None for a in attempts),
-            retry_mode=retry_mode,
+            elapsed_s=0.0,
+            truncated=truncated,
+            loop_detected=any(a.loop_at is not None for a in all_attempts),
+            retry_mode="dry" if "dry" in modes else ("longer" if modes else None),
         )
 
     def recover(self) -> None:

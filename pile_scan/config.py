@@ -54,7 +54,13 @@ MMPROJ_FILE = MODELS[DEFAULT_MODEL]["mmproj"]
 # than v1.0.0 and has the --image-min-tokens / --image-max-tokens flags Gemma 4
 # needs. The CUDA 12.8 build runs on Colab's R580 driver (CUDA up to 13.0);
 # don't pick a 13.x build newer than the driver supports.
-LLAMA_CPP_BUILD = "b12359"
+# "latest" uses the llama.cpp release cached on Drive (cache_dir/llama.cpp/),
+# or, when there is none, downloads the newest release and caches it. Delete
+# that folder on Drive to move to the newest release. A build number such as
+# "b12359" pins that release instead.
+LLAMA_CPP_BUILD = "latest"
+# Used when "latest" can't be looked up (GitHub unreachable) and nothing is cached.
+LLAMA_CPP_FALLBACK_BUILD = "b12359"
 LLAMA_CPP_CUDA = "12.8"
 
 # Default factual questions asked of every page. Keys become JSON keys in the
@@ -98,6 +104,10 @@ class ScanConfig:
     use_mtp: bool = False
     mtp_draft_max: int = 4
     max_soft_tokens: int = 1120
+    # Read each page's text in this many horizontal strips (1 = whole page).
+    # Each strip gets the full visual token budget, so small marks in narrow
+    # columns are seen in more detail; metadata still comes from the whole page.
+    strips: int = 1
     max_new_tokens: int = 3072
     # A page cut off at max_new_tokens without looping is read once more with
     # this limit, so genuinely long pages still come out whole.
@@ -142,6 +152,8 @@ class ScanConfig:
             raise ValueError("ctx_size is too small for max_soft_tokens + retry_max_new_tokens + prompt")
         if self.use_mtp and not self.mtp_file:
             raise ValueError(f"no MTP drafter is known for {self.model!r}")
+        if self.strips not in (1, 2, 3, 4):
+            raise ValueError("strips must be 1, 2, 3 or 4")
         if self.checkpoint_every < 1:
             raise ValueError("checkpoint_every must be at least 1")
         if self.sample_limit is not None and self.sample_limit < 1:

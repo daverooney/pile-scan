@@ -21,7 +21,7 @@ from typing import Any
 
 # Bump when the prompt changes in a way that affects results. Stored per page,
 # so later notebooks can tell which pages were read with which prompt.
-PROMPT_VERSION = 2   # 2: tables written as one line per filled row, never as grids
+PROMPT_VERSION = 3   # 2: tables as one line per filled row; 3: [?] for unclear marks, strips
 
 META_FIELDS = {
     "doc_title": "The document's title or subject line as printed, or a short description if none is printed.",
@@ -43,35 +43,116 @@ META_FIELDS = {
 # tokens), so grids are written as one line per filled row instead. A ticked
 # box becomes its column's heading, which is the information the mark carries.
 TABLE_RULES = (
-    "Tables, forms and grids: never draw borders, grid lines or empty cells. "
-    "Write the column headings once, on one line, separated by \" | \". Then write each row that has "
-    "something in it as one line, with its filled cells in order separated by \" | \". Where a row "
-    "marks a box or column with an X, tick or check, write that column's heading instead of the mark. "
-    "Leave out empty cells and empty rows. Start a printed example row with \"Example:\". For form "
-    "fields, write \"Label: value\", or just the label if it was left blank."
+    "Tables, forms and grids: never draw borders, grid lines or empty cells. Write instructions, "
+    "titles and other text around a table as ordinary lines, not side by side with the table's "
+    "columns. Write the column headings once, on one line, separated by \" | \". Then write each row "
+    "that has something in it as one line, with its filled cells in order separated by \" | \". "
+    "Where a row marks a box with an X, tick or check, look straight up from the mark to the heading "
+    "of the column it sits in, and write that heading instead of the mark. A row usually has at most "
+    "one mark in each group of related columns. If you cannot tell which column a mark is in, write "
+    "[?] instead of guessing. Leave out empty cells and empty rows. Start a printed example row with "
+    "\"Example:\". For form fields, write \"Label: value\", or just the label if it was left blank."
+)
+
+TEXT_RULES = (
+    "Transcribe every word exactly as written, top to bottom, keeping line breaks. Keep spelling, "
+    "numbers, names and punctuation exactly as printed, even if they look wrong. Mark words you "
+    "cannot read as [illegible]. Do not summarize or skip any text."
 )
 
 
-def build_prompt(questions: dict[str, str]) -> str:
+_INTRO = ("You are transcribing one scanned page from a pile of documents. "
+          "Pages may be out of order and from many different documents.\n\n")
+
+
+def _meta_block(questions: dict[str, str]) -> str:
     fields = "\n".join(f'  "{k}": {v}' for k, v in META_FIELDS.items())
     if questions:
         answers = "\n".join(f'    "{k}": {v}' for k, v in questions.items())
         answers_block = f'  "answers": an object with these keys:\n{answers}\n'
     else:
         answers_block = '  "answers": {}\n'
+    return ("a JSON object inside <meta></meta> tags with these keys:\n"
+            f"{fields}\n{answers_block}"
+            "Use null for anything not shown on the page. Do not guess.")
+
+
+def build_prompt(questions: dict[str, str]) -> str:
+    """The prompt for reading a whole page in one go: metadata, then text."""
     return (
-        "You are transcribing one scanned page from a pile of documents. "
-        "Pages may be out of order and from many different documents.\n\n"
-        "Reply with exactly two sections and nothing else.\n\n"
-        "First, a JSON object inside <meta></meta> tags with these keys:\n"
-        f"{fields}\n{answers_block}"
-        "Use null for anything not shown on the page. Do not guess.\n\n"
-        "Second, inside <text></text> tags, transcribe every word on the page exactly as written, "
-        "top to bottom, keeping line breaks. Keep spelling, numbers, names and punctuation exactly as "
-        "printed, even if they look wrong. Mark words you cannot read as [illegible]. Do not summarize "
-        "or skip any text.\n\n"
-        f"{TABLE_RULES}"
+        _INTRO
+        + "Reply with exactly two sections and nothing else.\n\n"
+        + "First, " + _meta_block(questions) + "\n\n"
+        + "Second, inside <text></text> tags: " + TEXT_RULES + "\n\n"
+        + TABLE_RULES
     )
+
+
+def build_meta_prompt(questions: dict[str, str]) -> str:
+    """When a page is read in strips: the whole page, for its metadata only."""
+    return (
+        _INTRO
+        + "Reply with only " + _meta_block(questions) + "\n\n"
+        + "Do not transcribe the page; that is done separately."
+    )
+
+
+def build_strip_prompt(part: int, parts: int) -> str:
+    """When a page is read in strips: the text of one horizontal strip.
+
+    Sent with two images, the whole page and then the strip, so the model can
+    see column headings that are outside the strip.
+    """
+    return (
+        "You are transcribing one scanned page in parts. The first image is the whole page. The "
+        f"second image is a close-up of part {part} of {parts}, a horizontal strip of the same page "
+        "(part 1 is the top). Transcribe only what is in the close-up, using the whole page to see "
+        "column headings and context that are outside it.\n\n"
+        "Reply with only the transcription inside <text></text> tags. " + TEXT_RULES + "\n\n"
+        + TABLE_RULES
+    )
+
+
+def text_section(raw: str) -> tuple[str, bool]:
+    """The text inside <text></text> in one strip's reply, and whether it was closed."""
+    cleaned = clean_response(raw)
+    m = _TEXT_RE.search(cleaned)
+    if not m:
+        return _META_RE.sub("", cleaned).strip(), True
+    return m.group(1).strip(), "</text>" in cleaned.lower()
+
+
+def meta_section(raw: str) -> str:
+    """Just the <meta>...</meta> block of a reply, closed even if the reply was cut off."""
+    m = _META_RE.search(clean_response(raw))
+    return f"<meta>{m.group(1).strip() if m else '{}'}</meta>"
+
+
+# --- tidying tables ---------------------------------------------------------------
+
+_ROW_NUMBER = re.compile(r"^\d{1,3}\.?$")
+
+
+def tidy_text(text: str | None) -> str | None:
+    """Drop the grid padding the model sometimes still writes.
+
+    On lines with " | " cells, empty cells are removed, and a line left with
+    nothing, or with only a row number, is dropped. Other lines are untouched.
+    The model's reply is kept as it was in `raw_response`.
+    """
+    if text is None:
+        return None
+    out = []
+    for line in text.split("\n"):
+        if "|" not in line:
+            out.append(line)
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        kept = [c for c in cells if c]
+        if not kept or (len(kept) == 1 and _ROW_NUMBER.match(kept[0]) and len(cells) > 1):
+            continue
+        out.append(" | ".join(kept))
+    return "\n".join(out).strip()
 
 
 # --- parsing -----------------------------------------------------------------
@@ -174,7 +255,7 @@ def parse_response(raw: str) -> dict[str, Any]:
     meta = _loads_lenient(meta_match.group(1)) if meta_match else None
     text_match = _TEXT_RE.search(cleaned)
     if text_match:
-        text = text_match.group(1).strip()
+        text = tidy_text(text_match.group(1).strip())
         truncated = "</text>" not in cleaned.lower()
     else:
         # The model ignored the format. Keep whatever isn't the meta block.

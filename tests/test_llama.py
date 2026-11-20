@@ -8,6 +8,7 @@ The real server needs a GPU; these use fake release tarballs and a fake server p
 import json
 import socket
 import subprocess
+import shutil
 import sys
 from pathlib import Path
 
@@ -147,9 +148,7 @@ def make_release_tar(path: Path, top: str, files: dict[str, bytes], links: dict[
             tf.addfile(info)
 
 
-def test_prebuilt_download_unpacks_flat_and_is_reused(tmp_path):
-    fetched = []
-
+def fake_release_download(fetched):
     def fake_download(url, dest, *, token=None, log=print):
         fetched.append(url)
         name = url.rsplit("/", 1)[1]
@@ -157,10 +156,27 @@ def test_prebuilt_download_unpacks_flat_and_is_reused(tmp_path):
             make_release_tar(dest, name.removesuffix(".tar.gz"), {"libcudart.so.12.8.90": b"rt"},
                              {"libcudart.so.12": "libcudart.so.12.8.90"})
         else:
-            make_release_tar(dest, "llama-b12359", {"llama-server": b"#!/bin/sh\n",
-                                                     "libggml-cuda.so": b"cuda"})
+            make_release_tar(dest, "llama-x", {"llama-server": b"#!/bin/sh\n",
+                                               "libggml-cuda.so": b"cuda"})
+    return fake_download
 
-    cfg = ScanConfig(local_dir=str(tmp_path / "vm"))
+
+def latest_release(tag):
+    calls = []
+
+    def fetch_json(url):
+        calls.append(url)
+        return {"tag_name": tag, "assets": [{"name": u.rsplit("/", 1)[1]}
+                                            for u in llama.release_assets(tag, "12.8")]}
+    fetch_json.calls = calls
+    return fetch_json
+
+
+def test_prebuilt_download_unpacks_flat_and_is_reused(tmp_path):
+    fetched = []
+    fake_download = fake_release_download(fetched)
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm"), cache_dir=str(tmp_path / "drive"),
+                     llama_cpp_build="b12359")
     server = llama.ensure_server_binary(cfg, download=fake_download, log=lambda *_: None)
     assert len(fetched) == 2
     folder = server.parent
@@ -168,14 +184,58 @@ def test_prebuilt_download_unpacks_flat_and_is_reused(tmp_path):
     # Libraries sit next to the server, where its RUNPATH ($ORIGIN) looks.
     assert (folder / "libggml-cuda.so").read_bytes() == b"cuda"
     assert (folder / "libcudart.so.12").read_bytes() == b"rt"
-    assert not list((tmp_path / "vm" / "downloads").iterdir())   # tarballs removed
+    assert not list((tmp_path / "vm" / "downloads").iterdir())   # tarballs moved to Drive
 
     llama.ensure_server_binary(cfg, download=fake_download, log=lambda *_: None)
     assert len(fetched) == 2
 
 
+def test_latest_release_is_cached_on_drive_until_deleted(tmp_path):
+    fetched = []
+    fake_download = fake_release_download(fetched)
+    drive = tmp_path / "drive"
+    newest = latest_release("b13000")
+    logs = []
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm1"), cache_dir=str(drive))
+    assert cfg.llama_cpp_build == "latest"
+    server = llama.ensure_server_binary(cfg, download=fake_download, log=logs.append, fetch_json=newest)
+    assert server.parent.name == "llama-b13000-cuda-12.8" and cfg.llama_cpp_build == "b13000"
+    assert len(fetched) == 2 and fetched[0].endswith("/b13000/llama-b13000-bin-ubuntu-cuda-12.8-x64.tar.gz")
+    cached = drive / "llama.cpp" / "b13000-cuda12.8"
+    assert (cached / ".complete").exists() and len(list(cached.glob("*.tar.gz"))) == 2
+    assert any("newest release" in m for m in logs)
+
+    # A new session: uses the Drive copy without asking GitHub, even if a newer release is out.
+    logs.clear()
+    cfg2 = ScanConfig(local_dir=str(tmp_path / "vm2"), cache_dir=str(drive))
+    newer = latest_release("b13500")
+    server2 = llama.ensure_server_binary(cfg2, download=fake_download, log=logs.append, fetch_json=newer)
+    assert server2.parent.name == "llama-b13000-cuda-12.8" and len(fetched) == 2 and not newer.calls
+    assert (server2.parent / "libcudart.so.12").read_bytes() == b"rt"
+    assert any("cached on Drive" in m for m in logs)
+    # The GPU code cache is named after the build in use.
+    gpu = llama.GpuInfo("Tesla T4", "580.82.07", "7.5", 15360)
+    assert llama.JitCache(cfg2, gpu, log=lambda *_: None).drive_file.name.startswith("b13000-cuda12.8-")
+
+    # Deleting the cache on Drive moves to the newest release.
+    shutil.rmtree(drive / "llama.cpp")
+    cfg3 = ScanConfig(local_dir=str(tmp_path / "vm3"), cache_dir=str(drive))
+    server3 = llama.ensure_server_binary(cfg3, download=fake_download, log=lambda *_: None, fetch_json=newer)
+    assert server3.parent.name == "llama-b13500-cuda-12.8" and len(fetched) == 4
+
+
+def test_latest_falls_back_when_github_is_unreachable(tmp_path):
+    def offline(url):
+        raise OSError("no network")
+    logs = []
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm"), cache_dir=str(tmp_path / "drive"))
+    build, source = llama.resolve_build(cfg, log=logs.append, fetch_json=offline)
+    assert (build, source) == ("b12359", "fallback") and "no network" in logs[0]
+
+
 def test_half_unpacked_server_is_redownloaded(tmp_path):
-    cfg = ScanConfig(local_dir=str(tmp_path / "vm"))
+    cfg = ScanConfig(local_dir=str(tmp_path / "vm"), cache_dir=str(tmp_path / "drive"),
+                     llama_cpp_build="b12359")
     folder = tmp_path / "vm" / f"llama-{cfg.llama_cpp_build}-cuda-{cfg.llama_cpp_cuda}"
     folder.mkdir(parents=True)
     (folder / "llama-server").write_text("partial")   # no .complete marker
@@ -187,6 +247,13 @@ def test_half_unpacked_server_is_redownloaded(tmp_path):
 
     llama.ensure_server_binary(cfg, download=fake_download, log=lambda *_: None)
     assert len(calls) == 2 and (folder / "llama-server").read_bytes() == b"ok"
+
+
+def test_unknown_server_option_gets_a_clear_error(tmp_path):
+    args = [sys.executable, "-c", "print('error: invalid argument: --spec-type'); raise SystemExit(1)"]
+    server = llama.LlamaServer(args, port=free_port(), log_path=tmp_path / "s.log", log=lambda *_: None)
+    with pytest.raises(RuntimeError, match="doesn't know the option --spec-type"):
+        server.start(timeout=10)
 
 
 def script(tmp_path, body):
