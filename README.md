@@ -55,6 +55,15 @@ The first scanned page logs how many image tokens the model actually received (w
 
 Run the same 20 pages twice into different databases (`SAMPLE_LIMIT = 20`, for example `MODEL = gemma-4-12b` into `sample_12b.db`, then `gemma-4-e4b` into `sample_e4b.db`), then run the compare cell at the bottom of the notebook. It reports text similarity per page and whether the numbers (dates, amounts, IDs) match, since that's where smaller or more compressed models tend to slip. The same works for 4-bit against 8-bit.
 
+## Making a test pile
+
+`notebooks/make_test_corpus.ipynb` (CPU runtime, no GPU) makes a pile with a known answer, for scoring the scanner and, later, the sort pass. By default it downloads volume 586 of the United States Reports from govinfo.gov to Drive, takes printed pages 1-145 (the first eleven opinions, each complete), and writes:
+
+- `CORPUS_DIR/pages/`: each page as a grayscale PNG at 200 dpi, text layer gone. `DEGRADE_SHARE` of them roughed up to look photocopied (grey paper, slight skew, speckle, sometimes an edge shadow, blur, JPEG artefacts), `ROTATE_SHARE` turned 90, 180 or 270 degrees. The order is partly shuffled: neighbours occasionally swap, about 8% of pages move in groups of 3 to 12, and about 3% land far away on their own. Files are named `scan_00001.png` and so on in pile order, so the scanner sees the shuffled order.
+- `CORPUS_DIR/answer_key/`: for each image its true position, PDF page, printed page number, section, the opinion it belongs to, the rotation and roughing up applied, and its text from the PDF's text layer as ground truth. The table of cases and the index are held out here, out of the pile, for comparison with what notebook 2 rebuilds.
+
+Point notebook 1's `INPUT_DIR` at `pages/`, never at the corpus folder. Everything random is seeded (`SEED`), and each page's treatment depends only on the seed and the page, so the same settings give the same pile. Sections are detected from running heads specific to the United States Reports (`pile_scan/testcorpus.py`); another PDF works, but its section labels won't mean much and nothing gets held out.
+
 ## What's in the database
 
 `pages` has one row per page, keyed by `(file_sha256, page_index)`:
@@ -94,4 +103,4 @@ uv lock
 uv export --frozen --no-dev --no-emit-project --no-hashes -o requirements-colab.txt
 ```
 
-The tests cover discovery, hashing, PDF and TIFF page splitting, reply parsing, checkpoints, resume after a simulated disconnect, the runtime checks, loop detection and retries, upgrading an older database, unpacking the prebuilt release, the T4 code cache, model downloads, and the HTTP calls to llama-server (against a fake server in `tests/fake_llama_server.py`). The real GPU and Gemma 4 itself only run in Colab.
+The tests cover the test-pile maker, discovery, hashing, PDF and TIFF page splitting, reply parsing, checkpoints, resume after a simulated disconnect, the runtime checks, loop detection and retries, upgrading an older database, unpacking the prebuilt release, the T4 code cache, model downloads, and the HTTP calls to llama-server (against a fake server in `tests/fake_llama_server.py`). The real GPU and Gemma 4 itself only run in Colab.
