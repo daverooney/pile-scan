@@ -30,7 +30,7 @@ def free_port() -> int:
 
 def test_server_args_have_gemma4_image_settings(tmp_path):
     cfg = ScanConfig(max_soft_tokens=1120)
-    args = llama.server_args(Path("/bin/llama-server"), Path("m.gguf"), Path("p.gguf"), cfg)
+    args = llama.server_args(Path("/bin/llama-server"), llama.ModelFiles(Path("m.gguf"), Path("p.gguf")), cfg)
 
     def val(flag):
         return args[args.index(flag) + 1]
@@ -41,12 +41,34 @@ def test_server_args_have_gemma4_image_settings(tmp_path):
     assert val("--mmproj") == "p.gguf" and val("-m") == "m.gguf"
     assert val("--reasoning-budget") == "0"
     assert val("--host") == "127.0.0.1"
+    assert val("--cache-ram") == "0"   # the prompt cache filled the VM's RAM
+    assert "--spec-type" not in args
+
+
+def test_server_args_with_mtp():
+    cfg = ScanConfig(use_mtp=True)
+    files = llama.ModelFiles(Path("m.gguf"), Path("p.gguf"), Path("mtp.gguf"))
+    args = llama.server_args(Path("/bin/llama-server"), files, cfg)
+    assert args[args.index("--spec-draft-model") + 1] == "mtp.gguf"
+    assert args[args.index("--spec-type") + 1] == "draft-mtp"
+    assert args[args.index("--spec-draft-n-max") + 1] == "4"
 
 
 def test_model_file_follows_quantization():
     assert ScanConfig(quantization="4bit").model_file == "gemma-4-12b-it-UD-Q4_K_XL.gguf"
     assert ScanConfig(quantization="8bit").model_file == "gemma-4-12b-it-Q8_0.gguf"
     assert ScanConfig(gguf_file="custom.gguf").model_label.endswith("/custom.gguf")
+
+
+def test_e4b_model_setting():
+    cfg = ScanConfig(model="gemma-4-e4b", quantization="8bit", use_mtp=True)
+    cfg.validate()
+    assert cfg.repo == "unsloth/gemma-4-E4B-it-GGUF"
+    assert cfg.model_file == "gemma-4-E4B-it-Q8_0.gguf"
+    assert cfg.mtp_file == "MTP/mtp-gemma-4-E4B-it-Q8_0.gguf"
+    assert cfg.model_label == "unsloth/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q8_0.gguf"
+    with pytest.raises(ValueError):
+        ScanConfig(model="gemma-5").validate()
 
 
 def test_ctx_size_must_fit_page():
@@ -249,17 +271,31 @@ def test_model_download_and_drive_cache(tmp_path):
 
     cfg = ScanConfig(model_dir=str(tmp_path / "vm1"), cache_dir=str(tmp_path / "drive"),
                      cache_models_on_drive=True)
-    model, mmproj = llama.ensure_model_files(cfg, download=fake_download, log=lambda *_: None)
-    assert model.name == "gemma-4-12b-it-UD-Q4_K_XL.gguf" and mmproj.name == "mmproj-F16.gguf"
+    files = llama.ensure_model_files(cfg, download=fake_download, log=lambda *_: None)
+    assert files.model.name == "gemma-4-12b-it-UD-Q4_K_XL.gguf" and files.mmproj.name == "mmproj-F16.gguf"
+    assert files.mtp is None
     assert fetched[0] == ("https://huggingface.co/unsloth/gemma-4-12b-it-GGUF/resolve/main/"
                           "gemma-4-12b-it-UD-Q4_K_XL.gguf")
     # Second VM: comes from Drive, no download.
     cfg2 = ScanConfig(model_dir=str(tmp_path / "vm2"), cache_dir=cfg.cache_dir, cache_models_on_drive=True)
     llama.ensure_model_files(cfg2, download=fake_download, log=lambda *_: None)
     assert len(fetched) == 2
+
+    # The E4B's projector has the same file name, so each repo gets its own folder.
+    cfg3 = ScanConfig(model="gemma-4-e4b", use_mtp=True, model_dir=cfg2.model_dir, cache_dir=cfg.cache_dir)
+    files3 = llama.ensure_model_files(cfg3, download=fake_download, log=lambda *_: None)
+    assert files3.mmproj != files.mmproj and files3.mtp.name == "mtp-gemma-4-E4B-it-Q8_0.gguf"
+    assert fetched[-1].endswith("/resolve/main/MTP/mtp-gemma-4-E4B-it-Q8_0.gguf")
     # Same VM again: nothing to do.
     llama.ensure_model_files(cfg2, download=fake_download, log=lambda *_: None)
-    assert len(fetched) == 2
+    llama.ensure_model_files(cfg3, download=fake_download, log=lambda *_: None)
+    assert len(fetched) == 5
+
+    # The E4B's projector has the same file name, so each repo gets its own folder.
+    cfg3 = ScanConfig(model="gemma-4-e4b", use_mtp=True, model_dir=cfg2.model_dir, cache_dir=cfg.cache_dir)
+    files3 = llama.ensure_model_files(cfg3, download=fake_download, log=lambda *_: None)
+    assert files3.mmproj != files.mmproj and files3.mtp.name == "mtp-gemma-4-E4B-it-Q8_0.gguf"
+    assert fetched[-1].endswith("/resolve/main/MTP/mtp-gemma-4-E4B-it-Q8_0.gguf")
 
 
 def test_download_resumes_partial_file(tmp_path):
@@ -292,16 +328,27 @@ def test_download_resumes_partial_file(tmp_path):
 
 # --- talking to the server ----------------------------------------------------------
 
-@pytest.fixture
-def fake_server(tmp_path):
+def start_fake(tmp_path, *extra):
     port = free_port()
     rec = tmp_path / "requests"
-    rec.mkdir()
-    args = [sys.executable, str(FAKE_SERVER), "--port", str(port), "--record-dir", str(rec)]
+    rec.mkdir(exist_ok=True)
+    args = [sys.executable, str(FAKE_SERVER), "--port", str(port), "--record-dir", str(rec), *extra]
     server = llama.LlamaServer(args, port=port, log_path=tmp_path / "server.log", log=lambda *_: None)
     server.start(timeout=30)
+    return server, port, rec
+
+
+@pytest.fixture
+def fake_server(tmp_path):
+    server, port, rec = start_fake(tmp_path)
     yield server, port, rec
     server.stop()
+
+
+def sent(rec):
+    """Image requests the reader sent, oldest first."""
+    reqs = [json.loads(p.read_text()) for p in sorted(rec.glob("req*.json"))]
+    return [r for r in reqs if r.get("max_tokens") != 1]
 
 
 def test_reader_sends_image_first_and_counts_image_tokens(fake_server, tmp_path):
@@ -316,14 +363,16 @@ def test_reader_sends_image_first_and_counts_image_tokens(fake_server, tmp_path)
     assert res.image_soft_tokens == 1080  # 1680 with image - 600 text only
     assert res.truncated is False
 
-    sent = json.loads(sorted(rec.glob("req*.json"))[0].read_text())
-    content = sent["messages"][0]["content"]
+    first = sent(rec)[0]
+    content = first["messages"][0]["content"]
     assert content[0]["type"] == "image_url"
     assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert content[1] == {"type": "text", "text": "Read this page."}
-    assert sent["temperature"] == 0
-    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
-    assert sent["max_tokens"] == cfg.max_new_tokens
+    assert first["temperature"] == 0
+    assert first["chat_template_kwargs"] == {"enable_thinking": False}
+    assert first["max_tokens"] == cfg.max_new_tokens
+    assert first["stream"] is True and "dry_multiplier" not in first
+    assert len(sent(rec)) == 1   # no retry needed
 
 
 def test_after_read_hook_runs_per_page(fake_server):
@@ -336,6 +385,84 @@ def test_after_read_hook_runs_per_page(fake_server):
     reader.read(Image.new("RGB", (8, 8)), "p")
     reader.read(Image.new("RGB", (8, 8)), "p")
     assert len(calls) == 2
+
+
+def test_loop_is_stopped_early_and_reread_with_dry(tmp_path):
+    from PIL import Image
+
+    server, port, rec = start_fake(tmp_path, "--loop", "1")
+    try:
+        reader = llama.LlamaPageReader(server, ScanConfig(server_port=port), log=lambda *_: None)
+        res = reader.read(Image.new("RGB", (8, 8)), "p")
+    finally:
+        server.stop()
+    reqs = sent(rec)
+    assert len(reqs) == 2
+    assert reqs[1]["dry_multiplier"] > 0 and reqs[1]["dry_sequence_breakers"] == ["<"]
+    assert res.loop_detected and res.retry_mode == "dry" and not res.truncated
+    assert "Hello" in res.raw
+    # Stopped long before the 3072-token limit (each loop token is one chunk).
+    assert res.output_tokens < 600 + 42
+
+
+def test_looping_without_retry_keeps_text_before_the_loop(tmp_path):
+    from PIL import Image
+
+    server, port, rec = start_fake(tmp_path, "--loop", "1")
+    try:
+        reader = llama.LlamaPageReader(server, ScanConfig(server_port=port), log=lambda *_: None, retry=False)
+        res = reader.read(Image.new("RGB", (8, 8)), "p")
+    finally:
+        server.stop()
+    assert res.truncated and res.loop_detected and res.retry_mode is None
+    assert res.raw.endswith("Header | Amount")    # the "| | |" run is cut off
+
+
+def test_long_page_is_reread_with_more_tokens(tmp_path):
+    from PIL import Image
+
+    server, port, rec = start_fake(tmp_path, "--long", "1")
+    try:
+        cfg = ScanConfig(server_port=port)
+        reader = llama.LlamaPageReader(server, cfg, log=lambda *_: None)
+        res = reader.read(Image.new("RGB", (8, 8)), "p")
+    finally:
+        server.stop()
+    reqs = sent(rec)
+    assert [r["max_tokens"] for r in reqs] == [cfg.max_new_tokens, cfg.retry_max_new_tokens]
+    assert "dry_multiplier" not in reqs[1]
+    assert res.retry_mode == "longer" and not res.loop_detected and not res.truncated
+
+
+def test_still_truncated_page_is_saved_for_retry(tmp_path, cfg):
+    import sqlite3
+
+    server, port, rec = start_fake(tmp_path, "--long", "100")
+    try:
+        cfg.server_port = port
+        cfg.max_new_tokens, cfg.retry_max_new_tokens = 300, 400
+        reader = llama.LlamaPageReader(server, cfg, log=lambda *_: None)
+        s = run_scan(cfg, reader, log=lambda *_: None)
+    finally:
+        server.stop()
+    assert s.pages_truncated == 7
+    conn = sqlite3.connect(cfg.drive_db_path)
+    rows = conn.execute("SELECT status, truncated, retry_mode FROM pages").fetchall()
+    assert set(rows) == {("truncated", 1, "longer")}
+
+    # A normal re-run leaves them; RETRY_ERRORS reads them again.
+    server, port, rec = start_fake(tmp_path)
+    try:
+        cfg.server_port = port
+        reader = llama.LlamaPageReader(server, cfg, log=lambda *_: None)
+        assert run_scan(cfg, reader, log=lambda *_: None).pages_read == 0
+        cfg.retry_errors = True
+        s = run_scan(cfg, reader, log=lambda *_: None)
+    finally:
+        server.stop()
+    assert s.pages_read == 7 and s.pages_truncated == 0
+    conn = sqlite3.connect(cfg.drive_db_path)
+    assert {r[0] for r in conn.execute("SELECT status FROM pages")} == {"done"}
 
 
 def test_recover_restarts_dead_server(fake_server):

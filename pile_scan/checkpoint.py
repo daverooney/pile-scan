@@ -47,14 +47,14 @@ def progress(path: Path, *, read_only: bool = True) -> tuple[int, int, float]:
     Used to decide which copy holds the most work. File mtimes can't be trusted
     for this: the local copy runs in WAL mode, so recent pages may sit in the
     -wal file while the main file's mtime stays old. Pages are only ever added,
-    or moved from error to done, so these counts only grow.
+    or moved from error to done or truncated, so these counts only grow.
     """
     try:
         uri = f"file:{path}?mode=ro" if read_only else f"file:{path}"
         conn = sqlite3.connect(uri, uri=True)
         try:
             row = conn.execute(
-                "SELECT COALESCE(SUM(status='done'), 0), COUNT(*), COALESCE(MAX(created_at), 0) FROM pages"
+                "SELECT COALESCE(SUM(status IN ('done', 'truncated')), 0), COUNT(*), COALESCE(MAX(created_at), 0) FROM pages"
             ).fetchone()
         finally:
             conn.close()

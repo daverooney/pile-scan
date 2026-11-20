@@ -1,6 +1,8 @@
 """End-to-end scan with a fake model: resume, checkpoints, sampling, failures."""
 
 import sqlite3
+
+from pile_scan import extract
 from pathlib import Path
 
 import pytest
@@ -34,7 +36,7 @@ def test_full_scan(cfg):
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 4
     r = conn.execute("SELECT first_line, last_line, page_number_int, image_soft_tokens, prompt_version "
                      "FROM pages LIMIT 1").fetchone()
-    assert r[0].startswith("First line") and r[1] == "Last line" and r[3] == 1080 and r[4] == 1
+    assert r[0].startswith("First line") and r[1] == "Last line" and r[3] == 1080 and r[4] == extract.PROMPT_VERSION
 
 
 def test_rerun_does_nothing(cfg):
@@ -145,3 +147,33 @@ def test_newer_schema_refused(tmp_path):
     conn.close()
     with pytest.raises(RuntimeError):
         db.connect(p)
+
+
+def test_old_database_is_upgraded_and_cut_off_pages_retried(cfg):
+    """A v1 database (pages cut off were saved as done) gains the new columns,
+    and RETRY_ERRORS reads its cut-off pages again."""
+    from pile_scan import db
+
+    run_scan(cfg, FakeReader(), log=lambda *_: None)
+    conn = sqlite3.connect(cfg.drive_db_path)
+    conn.execute("UPDATE pages SET truncated=1 WHERE page_index=0")
+    conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
+    # Make it look like the v1 schema, without the two new columns.
+    conn = sqlite3.connect(cfg.drive_db_path)
+    conn.execute("ALTER TABLE pages DROP COLUMN loop_detected")
+    conn.execute("ALTER TABLE pages DROP COLUMN retry_mode")
+    conn.commit()
+    conn.close()
+    import shutil
+    shutil.rmtree(cfg.local_dir)
+
+    cfg.retry_errors = True
+    reader = FakeReader()
+    s = run_scan(cfg, reader, log=lambda *_: None)
+    n_first_pages = 4   # one page 0 per distinct file
+    assert reader.calls == n_first_pages and s.pages_read == n_first_pages
+    conn = sqlite3.connect(cfg.drive_db_path)
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == str(db.SCHEMA_VERSION)
+    assert conn.execute("SELECT COUNT(*) FROM pages WHERE truncated=1").fetchone()[0] == 0

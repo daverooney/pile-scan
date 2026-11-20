@@ -15,17 +15,39 @@ from pathlib import Path
 # higher keeps more resolution for small text. 1120 is the most detail.
 ALLOWED_SOFT_TOKENS = (70, 140, 280, 560, 1120)
 
-# GGUF builds of Gemma 4 12B for llama.cpp, from
-# https://huggingface.co/unsloth/gemma-4-12b-it-GGUF (file names checked against
-# the repo's file list). UD-Q4_K_XL is Unsloth's recommended 4-bit build.
-GGUF_REPO = "unsloth/gemma-4-12b-it-GGUF"
-GGUF_FILES = {
-    "4bit": "gemma-4-12b-it-UD-Q4_K_XL.gguf",  # 7.4 GB: fits a free T4 (16 GB)
-    "8bit": "gemma-4-12b-it-Q8_0.gguf",        # 12.7 GB: use an L4 (24 GB)
+# GGUF builds of Gemma 4 for llama.cpp from Unsloth (file names and sizes
+# checked against each repo's file list, 2026-11-20). UD-Q4_K_XL is Unsloth's
+# recommended 4-bit build. `mmproj` is the vision projector llama.cpp needs for
+# image input; `mtp` is the optional multi-token-prediction drafter that speeds
+# up generation (llama.cpp's --spec-type draft-mtp) without changing the output.
+MODELS: dict[str, dict] = {
+    "gemma-4-12b": {
+        "repo": "unsloth/gemma-4-12b-it-GGUF",
+        "files": {
+            "4bit": "gemma-4-12b-it-UD-Q4_K_XL.gguf",  # 7.4 GB: fits a free T4 (16 GB)
+            "8bit": "gemma-4-12b-it-Q8_0.gguf",        # 12.7 GB: use an L4 (24 GB)
+        },
+        "gib": {"4bit": 6.9, "8bit": 11.8},
+        "mmproj": "mmproj-F16.gguf",                   # 175 MB
+        "mtp": "MTP/mtp-gemma-4-12b-it-Q8_0.gguf",     # 465 MB
+    },
+    "gemma-4-e4b": {
+        "repo": "unsloth/gemma-4-E4B-it-GGUF",
+        "files": {
+            "4bit": "gemma-4-E4B-it-UD-Q4_K_XL.gguf",  # 5.1 GB
+            "8bit": "gemma-4-E4B-it-Q8_0.gguf",        # 8.2 GB: fits a T4
+        },
+        "gib": {"4bit": 4.8, "8bit": 7.6},
+        "mmproj": "mmproj-F16.gguf",                   # 990 MB
+        "mtp": "MTP/mtp-gemma-4-E4B-it-Q8_0.gguf",     # 99 MB
+    },
 }
-# The vision projector llama.cpp needs alongside the model for image input.
-MMPROJ_FILE = "mmproj-F16.gguf"
-QUANTIZATIONS = tuple(GGUF_FILES)
+DEFAULT_MODEL = "gemma-4-12b"
+QUANTIZATIONS = ("4bit", "8bit")
+# Kept for older code and notes that refer to them.
+GGUF_REPO = MODELS[DEFAULT_MODEL]["repo"]
+GGUF_FILES = MODELS[DEFAULT_MODEL]["files"]
+MMPROJ_FILE = MODELS[DEFAULT_MODEL]["mmproj"]
 
 # llama.cpp release to download, prebuilt for CUDA, from
 # https://github.com/ggml-org/llama.cpp/releases. b12359 (2026-11-19) is newer
@@ -66,13 +88,21 @@ class ScanConfig:
     retry_errors: bool = False
 
     # Model.
+    model: str = DEFAULT_MODEL   # a key of MODELS: "gemma-4-12b" or "gemma-4-e4b"
     quantization: str = "4bit"  # "4bit" (free T4) or "8bit" (L4 or bigger)
-    gguf_repo: str = GGUF_REPO
-    gguf_file: str | None = None  # override the file picked by `quantization`
-    mmproj_file: str = MMPROJ_FILE
+    gguf_repo: str | None = None    # override the repo picked by `model`
+    gguf_file: str | None = None    # override the file picked by `quantization`
+    mmproj_file: str | None = None  # override the vision projector
+    # Multi-token prediction: a small drafter proposes a few tokens and the
+    # model checks them in one pass. Same output, usually faster decoding.
+    use_mtp: bool = False
+    mtp_draft_max: int = 4
     max_soft_tokens: int = 1120
     max_new_tokens: int = 3072
-    ctx_size: int = 8192
+    # A page cut off at max_new_tokens without looping is read once more with
+    # this limit, so genuinely long pages still come out whole.
+    retry_max_new_tokens: int = 6144
+    ctx_size: int = 10240
 
     # llama.cpp server, downloaded prebuilt each session (about 800 MB). On a T4
     # the GPU driver compiles its kernels on first use; that result is cached
@@ -101,13 +131,17 @@ class ScanConfig:
             raise ValueError(
                 f"max_soft_tokens must be one of {ALLOWED_SOFT_TOKENS}, got {self.max_soft_tokens}"
             )
+        if self.model not in MODELS and not (self.gguf_repo and self.gguf_file and self.mmproj_file):
+            raise ValueError(f"model must be one of {tuple(MODELS)}, got {self.model!r}")
         if self.quantization not in QUANTIZATIONS and not self.gguf_file:
             raise ValueError(f"quantization must be one of {QUANTIZATIONS}, got {self.quantization!r}")
         # Gemma 4 encodes an image's tokens in one non-causal pass, so they must
         # fit in a single ubatch; the server is started with 2048. Leave room
         # for the prompt and the reply as well.
-        if self.ctx_size < self.max_soft_tokens + self.max_new_tokens + 1024:
-            raise ValueError("ctx_size is too small for max_soft_tokens + max_new_tokens + prompt")
+        if self.ctx_size < self.max_soft_tokens + max(self.max_new_tokens, self.retry_max_new_tokens) + 1024:
+            raise ValueError("ctx_size is too small for max_soft_tokens + retry_max_new_tokens + prompt")
+        if self.use_mtp and not self.mtp_file:
+            raise ValueError(f"no MTP drafter is known for {self.model!r}")
         if self.checkpoint_every < 1:
             raise ValueError("checkpoint_every must be at least 1")
         if self.sample_limit is not None and self.sample_limit < 1:
@@ -117,13 +151,33 @@ class ScanConfig:
                 raise ValueError(f"question key {key!r} must be a simple identifier")
 
     @property
+    def _model_info(self) -> dict:
+        return MODELS.get(self.model, {})
+
+    @property
+    def repo(self) -> str:
+        return self.gguf_repo or self._model_info["repo"]
+
+    @property
     def model_file(self) -> str:
-        return self.gguf_file or GGUF_FILES[self.quantization]
+        return self.gguf_file or self._model_info["files"][self.quantization]
+
+    @property
+    def mmproj(self) -> str:
+        return self.mmproj_file or self._model_info["mmproj"]
+
+    @property
+    def mtp_file(self) -> str | None:
+        return self._model_info.get("mtp") if not self.gguf_file else None
+
+    @property
+    def weights_gib(self) -> float | None:
+        return None if self.gguf_file else self._model_info.get("gib", {}).get(self.quantization)
 
     @property
     def model_label(self) -> str:
         """Stored with every page so results can be traced to the exact weights."""
-        return f"{self.gguf_repo}/{self.model_file}"
+        return f"{self.repo}/{self.model_file}"
 
     @property
     def local_db_path(self) -> Path:

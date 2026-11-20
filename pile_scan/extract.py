@@ -21,7 +21,7 @@ from typing import Any
 
 # Bump when the prompt changes in a way that affects results. Stored per page,
 # so later notebooks can tell which pages were read with which prompt.
-PROMPT_VERSION = 1
+PROMPT_VERSION = 2   # 2: tables written as one line per filled row, never as grids
 
 META_FIELDS = {
     "doc_title": "The document's title or subject line as printed, or a short description if none is printed.",
@@ -36,6 +36,20 @@ META_FIELDS = {
     "ends_mid_sentence": "true if the last line breaks off mid-sentence and continues on another page.",
     "language": "ISO 639-1 code of the main language, e.g. \"en\".",
 }
+
+
+# Tables and forms. Asking for Markdown tables made the model loop on ruled
+# forms with mostly empty cells (it kept writing "| | |" until it ran out of
+# tokens), so grids are written as one line per filled row instead. A ticked
+# box becomes its column's heading, which is the information the mark carries.
+TABLE_RULES = (
+    "Tables, forms and grids: never draw borders, grid lines or empty cells. "
+    "Write the column headings once, on one line, separated by \" | \". Then write each row that has "
+    "something in it as one line, with its filled cells in order separated by \" | \". Where a row "
+    "marks a box or column with an X, tick or check, write that column's heading instead of the mark. "
+    "Leave out empty cells and empty rows. Start a printed example row with \"Example:\". For form "
+    "fields, write \"Label: value\", or just the label if it was left blank."
+)
 
 
 def build_prompt(questions: dict[str, str]) -> str:
@@ -54,8 +68,9 @@ def build_prompt(questions: dict[str, str]) -> str:
         "Use null for anything not shown on the page. Do not guess.\n\n"
         "Second, inside <text></text> tags, transcribe every word on the page exactly as written, "
         "top to bottom, keeping line breaks. Keep spelling, numbers, names and punctuation exactly as "
-        "printed, even if they look wrong. Render tables as Markdown tables. Mark words you cannot read "
-        "as [illegible]. Do not summarize or skip anything."
+        "printed, even if they look wrong. Mark words you cannot read as [illegible]. Do not summarize "
+        "or skip any text.\n\n"
+        f"{TABLE_RULES}"
     )
 
 

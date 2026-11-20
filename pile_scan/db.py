@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -74,11 +74,13 @@ CREATE TABLE IF NOT EXISTS pages (
     id                  INTEGER PRIMARY KEY,
     file_sha256         TEXT NOT NULL REFERENCES files(file_sha256),
     page_index          INTEGER NOT NULL,          -- 0-based position in its file
-    status              TEXT NOT NULL,             -- done | error
+    status              TEXT NOT NULL,             -- done | truncated | error
     -- What the model read.
     ocr_text            TEXT,
     pdf_text_layer      TEXT,                      -- embedded text, for born-digital PDFs
-    truncated           INTEGER NOT NULL DEFAULT 0,-- 1 if generation hit max_new_tokens
+    truncated           INTEGER NOT NULL DEFAULT 0,-- 1 if the reply was cut off (token limit or a loop)
+    loop_detected       INTEGER NOT NULL DEFAULT 0,-- 1 if a reading of this page got stuck repeating itself
+    retry_mode          TEXT,                      -- how the page was re-read: 'dry' (loop) or 'longer'
     -- Ordering clues for the sorting pass.
     doc_title           TEXT,
     doc_type            TEXT,
@@ -120,7 +122,7 @@ CREATE INDEX IF NOT EXISTS pages_by_date ON pages(primary_date);
 """
 
 PAGE_COLUMNS = (
-    "status", "ocr_text", "pdf_text_layer", "truncated",
+    "status", "ocr_text", "pdf_text_layer", "truncated", "loop_detected", "retry_mode",
     "doc_title", "doc_type", "page_number_printed", "page_number_int", "page_total_int",
     "dates_json", "primary_date", "first_line", "last_line", "running_header",
     "running_footer", "starts_mid_sentence", "ends_mid_sentence", "language",
@@ -156,7 +158,20 @@ def init_schema(conn: sqlite3.Connection) -> None:
             f"Database schema v{row['value']} is newer than this code (v{SCHEMA_VERSION}). "
             "Update pile-scan before scanning into it."
         )
+    else:
+        _migrate(conn, int(row["value"]))
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection, version: int) -> None:
+    """Bring an older database up to SCHEMA_VERSION, keeping every row."""
+    if version < 2:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(pages)")}
+        if "loop_detected" not in cols:
+            conn.execute("ALTER TABLE pages ADD COLUMN loop_detected INTEGER NOT NULL DEFAULT 0")
+        if "retry_mode" not in cols:
+            conn.execute("ALTER TABLE pages ADD COLUMN retry_mode TEXT")
+    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),))
 
 
 # --- runs -------------------------------------------------------------------
@@ -231,9 +246,13 @@ def get_file(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
 # --- pages ------------------------------------------------------------------
 
 def finished_pages(conn: sqlite3.Connection, sha256: str, *, retry_errors: bool) -> set[int]:
-    """Page indexes of this file that need no more work."""
+    """Page indexes of this file that need no more work.
+
+    With retry_errors, pages that failed or were cut off are read again. That
+    includes pages saved as done with truncated=1 by earlier versions.
+    """
     if retry_errors:
-        q = "SELECT page_index FROM pages WHERE file_sha256=? AND status='done'"
+        q = "SELECT page_index FROM pages WHERE file_sha256=? AND status='done' AND truncated=0"
     else:
         q = "SELECT page_index FROM pages WHERE file_sha256=?"
     return {r["page_index"] for r in conn.execute(q, (sha256,))}

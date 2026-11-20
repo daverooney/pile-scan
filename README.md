@@ -31,21 +31,27 @@ If this repo is private, add a Colab secret named `GITHUB_TOKEN` with a read-onl
 
 | Setting | Default | Notes |
 |---|---|---|
-| `QUANTIZATION` | `4bit` | `4bit` is `gemma-4-12b-it-UD-Q4_K_XL.gguf` (7.4 GB), fits a free T4. `8bit` is `gemma-4-12b-it-Q8_0.gguf` (12.7 GB), use an L4. |
+| `MODEL` | `gemma-4-12b` | `gemma-4-12b` reads pages best. `gemma-4-e4b` is about twice as fast; Google's numbers put it close on plain transcription but well behind on understanding a page. Each has its own GGUF repo from Unsloth. |
+| `QUANTIZATION` | `4bit` | 12B: `4bit` is `UD-Q4_K_XL` (7.4 GB) and fits a free T4; `8bit` is `Q8_0` (12.7 GB), use an L4. E4B: 5.1 and 8.2 GB, both fit a T4. |
+| `USE_MTP` | off | Multi-token prediction: Unsloth's small drafter (`MTP/mtp-…-Q8_0.gguf`) proposes tokens and the model checks them. Same text at temperature 0, usually faster. Not yet timed on a T4. |
 | `MAX_SOFT_TOKENS` | `1120` | Gemma 4's visual token budget: 70, 140, 280, 560 or 1120. Passed to llama-server as `--image-min-tokens` and `--image-max-tokens`, with batch and ubatch at 2048 so an image's tokens fit in one pass. |
-| `MAX_NEW_TOKENS` | `3072` | Pages that hit this are flagged `truncated = 1`. |
+| `MAX_NEW_TOKENS` | `3072` | A page that reaches this without looping is read once more with 6144. |
 | `SAMPLE_LIMIT` | `0` (all) | Stop after N pages. Files are visited in sorted order, so N always means the same pages. |
-| `RETRY_ERRORS` | off | Re-read pages that failed on an earlier run. |
+| `RETRY_ERRORS` | off | Re-read pages that failed or were cut off on an earlier run. With `SAMPLE_LIMIT` it stops after that many re-reads. |
 | `CACHE_MODELS_ON_DRIVE` | off | Keep the GGUF files on Drive too. Costs Drive space, saves a download per session. |
 | `DISCONNECT_WHEN_DONE` | off | Releases the GPU at the end so a finished run stops spending compute units. |
 
 The llama.cpp release is pinned in `pile_scan/config.py` (`LLAMA_CPP_BUILD`, currently `b12359`, and `LLAMA_CPP_CUDA`, `12.8`). Keep the CUDA version at or below what Colab's driver supports (`nvidia-smi` shows it; 13.0 on the 2026.10 runtime). A new release or driver starts a fresh T4 code cache.
 
+**Loops.** With greedy decoding the model can get stuck repeating itself; on ruled forms it kept writing empty table cells until it ran out of tokens. The prompt now asks for one line per filled table row (a ticked box is written as its column's heading) instead of Markdown grids. Replies are also streamed, and a reply that starts repeating is stopped at once (`pile_scan/loops.py`) and read again with llama.cpp's DRY repetition penalty. Pages still cut off after that are saved with `status = 'truncated'`.
+
+**System RAM.** The server runs with `--cache-ram 0`. Its prompt cache otherwise keeps up to 8 GiB of past requests in RAM, which never helps when every page is different.
+
 The first scanned page logs how many image tokens the model actually received (worked out from the server's prompt token counts). It should be close to the budget. A number near 280 means the setting didn't take effect.
 
-### Comparing 4-bit with 8-bit
+### Comparing models and settings
 
-Run the same 20 pages twice into different databases (`SAMPLE_LIMIT = 20`, `DB_NAME = sample_4bit.db`, then `8bit` on an L4 into `sample_8bit.db`), then run the compare cell at the bottom of the notebook. It reports text similarity per page and whether the numbers (dates, amounts, IDs) match, since that's where lower precision tends to slip.
+Run the same 20 pages twice into different databases (`SAMPLE_LIMIT = 20`, for example `MODEL = gemma-4-12b` into `sample_12b.db`, then `gemma-4-e4b` into `sample_e4b.db`), then run the compare cell at the bottom of the notebook. It reports text similarity per page and whether the numbers (dates, amounts, IDs) match, since that's where smaller or more compressed models tend to slip. The same works for 4-bit against 8-bit.
 
 ## What's in the database
 
@@ -54,6 +60,7 @@ Run the same 20 pages twice into different databases (`SAMPLE_LIMIT = 20`, `DB_N
 - `ocr_text`: the transcription. `pdf_text_layer` holds a PDF's embedded text when it has one.
 - Ordering clues for the sort pass: `doc_title`, `doc_type`, `page_number_printed` (plus parsed `page_number_int` and `page_total_int` from "3 of 7"), `dates_json`, `primary_date`, `first_line`, `last_line`, `running_header`, `running_footer`, `starts_mid_sentence`, `ends_mid_sentence`, `language`.
 - `answers_json`: answers to the questions in the settings cell.
+- `status`: `done`, `truncated` (still cut off after a retry) or `error`. `loop_detected` and `retry_mode` (`dry` or `longer`) say whether a page had to be read twice and why.
 - Provenance: `raw_response`, `model_id`, `quantization`, `max_soft_tokens`, `image_soft_tokens`, `prompt_version`, `run_id`, timings.
 
 `files` has one row per distinct file content (by SHA-256), so renamed or duplicated files are read once. `file_paths` lists every path each file was seen at. `runs` records each run's settings.
@@ -85,4 +92,4 @@ uv lock
 uv export --frozen --no-dev --no-emit-project --no-hashes -o requirements-colab.txt
 ```
 
-The tests cover discovery, hashing, PDF and TIFF page splitting, reply parsing, checkpoints, resume after a simulated disconnect, the runtime checks, unpacking the prebuilt release, the T4 code cache, model downloads, and the HTTP calls to llama-server (against a fake server in `tests/fake_llama_server.py`). The real GPU and Gemma 4 itself only run in Colab.
+The tests cover discovery, hashing, PDF and TIFF page splitting, reply parsing, checkpoints, resume after a simulated disconnect, the runtime checks, loop detection and retries, upgrading an older database, unpacking the prebuilt release, the T4 code cache, model downloads, and the HTTP calls to llama-server (against a fake server in `tests/fake_llama_server.py`). The real GPU and Gemma 4 itself only run in Colab.

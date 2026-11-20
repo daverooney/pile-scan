@@ -12,7 +12,9 @@ class ReadResult:
     output_tokens: int
     image_soft_tokens: int | None    # visual tokens the model actually saw, if known
     elapsed_s: float
-    truncated: bool = False          # generation stopped at the token limit
+    truncated: bool = False          # cut off at the token limit, or stopped in a loop
+    loop_detected: bool = False      # a reading got stuck repeating itself
+    retry_mode: str | None = None    # "dry" or "longer" if the page was read a second time
 
 
 class PageReader(Protocol):

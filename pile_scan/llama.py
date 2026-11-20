@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import ScanConfig
+from .loops import find_loop
 from .reader import ReadResult
 
 BATCH_SIZE = 2048
@@ -130,11 +131,11 @@ def check_environment(cfg: ScanConfig, *, runner: Runner = _run, glibc: tuple[in
             f"GPU driver {gpu.driver} is too old for the CUDA {cfg.llama_cpp_cuda} build "
             f"(needs {MIN_DRIVER} or newer). Switch to the latest runtime version."
         )
-    # File sizes in GiB, plus about 3.5 GiB for the vision projector, KV cache
+    # Weights in GiB, plus about 3.5 GiB for the vision projector, KV cache
     # and the 2048-token compute buffers.
-    weights_gib = {"4bit": 6.9, "8bit": 11.8}.get(cfg.quantization)
+    weights_gib = cfg.weights_gib
     if weights_gib and weights_gib + 3.5 > gpu.memory_mib / 1024:
-        log(f"Warning: {cfg.quantization} may not fit on this {gpu.name} "
+        log(f"Warning: {cfg.model} {cfg.quantization} may not fit on this {gpu.name} "
             f"({gpu.memory_mib / 1024:.0f} GiB). If the server runs out of memory, use 4bit or an L4.")
     log(f"Runtime OK: glibc {glibc[0]}.{glibc[1]}, {gpu.name} ({gpu.memory_mib} MiB), "
         f"driver {gpu.driver}, compute {gpu.compute_cap}.")
@@ -363,40 +364,52 @@ def _download(url: str, dest: Path, *, token: str | None = None, log=print) -> N
     os.replace(part, dest)
 
 
+@dataclass
+class ModelFiles:
+    model: Path
+    mmproj: Path
+    mtp: Path | None = None   # the MTP drafter, when cfg.use_mtp
+
+
 def ensure_model_files(cfg: ScanConfig, *, token: str | None = None, log=print,
-                       download=_download) -> tuple[Path, Path]:
-    """Make sure the model and vision projector are on local disk. Returns their paths."""
-    model_dir = Path(cfg.model_dir)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    drive_dir = Path(cfg.cache_dir) / "models" / cfg.gguf_repo.replace("/", "__")
+                       download=_download) -> ModelFiles:
+    """Make sure the model, vision projector and (if used) MTP drafter are on local disk."""
+    # One folder per repo: the 12B and E4B both call their projector mmproj-F16.gguf.
+    repo_slug = cfg.repo.replace("/", "__")
+    model_dir = Path(cfg.model_dir) / repo_slug
+    drive_dir = Path(cfg.cache_dir) / "models" / repo_slug
+    names = [cfg.model_file, cfg.mmproj]
+    if cfg.use_mtp:
+        names.append(cfg.mtp_file)
     out = []
-    for name in (cfg.model_file, cfg.mmproj_file):
+    for name in names:
         local = model_dir / name
         cached = drive_dir / name
+        local.parent.mkdir(parents=True, exist_ok=True)
         if local.exists() and local.stat().st_size > 0:
             pass
         elif cfg.cache_models_on_drive and cached.exists():
             log(f"Copying {name} from Drive cache")
             shutil.copyfile(cached, local)
         else:
-            log(f"Downloading {name} from {cfg.gguf_repo}")
-            download(hf_url(cfg.gguf_repo, name), local, token=token, log=log)
+            log(f"Downloading {name} from {cfg.repo}")
+            download(hf_url(cfg.repo, name), local, token=token, log=log)
             if cfg.cache_models_on_drive:
-                drive_dir.mkdir(parents=True, exist_ok=True)
-                tmp = drive_dir / f"{name}.tmp-{os.getpid()}"
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cached.with_name(f"{cached.name}.tmp-{os.getpid()}")
                 shutil.copyfile(local, tmp)
                 os.replace(tmp, cached)
         out.append(local)
-    return out[0], out[1]
+    return ModelFiles(model=out[0], mmproj=out[1], mtp=out[2] if cfg.use_mtp else None)
 
 
 # --- the server --------------------------------------------------------------
 
-def server_args(binary: Path, model: Path, mmproj: Path, cfg: ScanConfig) -> list[str]:
-    return [
+def server_args(binary: Path, files: ModelFiles, cfg: ScanConfig) -> list[str]:
+    args = [
         str(binary),
-        "-m", str(model),
-        "--mmproj", str(mmproj),
+        "-m", str(files.model),
+        "--mmproj", str(files.mmproj),
         "-ngl", "999",                                   # every layer on the GPU
         "-c", str(cfg.ctx_size),
         "-b", str(BATCH_SIZE), "-ub", str(BATCH_SIZE),   # see module docstring
@@ -404,9 +417,21 @@ def server_args(binary: Path, model: Path, mmproj: Path, cfg: ScanConfig) -> lis
         "--image-max-tokens", str(cfg.max_soft_tokens),
         "--reasoning-budget", "0",                       # no thinking: we want the transcription
         "-np", "1",                                      # one page at a time
+        # The prompt cache keeps each finished request's state in system RAM
+        # (8 GiB by default) for reuse. Every page is different, so it never
+        # helps, and it filled most of a 12.7 GB Colab VM in 11 pages.
+        "--cache-ram", "0",
         "--no-webui",
         "--host", "127.0.0.1", "--port", str(cfg.server_port),
     ]
+    if files.mtp is not None:
+        args += [
+            "--spec-draft-model", str(files.mtp),
+            "--spec-type", "draft-mtp",
+            "--spec-draft-n-max", str(cfg.mtp_draft_max),
+            "--spec-draft-ngl", "all",
+        ]
+    return args
 
 
 class LlamaServer:
@@ -480,39 +505,130 @@ def _png_data_uri(image) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+# Used only when re-reading a page that looped. DRY ("don't repeat yourself")
+# penalises tokens that extend a sequence already seen. llama.cpp's default
+# sequence breakers include newline, which would let a "|"-per-line loop
+# through, so "<" (only in our tags) is the sole breaker here.
+DRY_SETTINGS = {
+    "dry_multiplier": 0.8,
+    "dry_base": 1.75,
+    "dry_allowed_length": 3,
+    "dry_penalty_last_n": 1024,
+    "dry_sequence_breakers": ["<"],
+}
+
+
+@dataclass
+class _Attempt:
+    text: str
+    finish_reason: str | None
+    prompt_tokens: int | None
+    completion_tokens: int
+    loop_at: int | None = None
+
+    @property
+    def cut_off(self) -> bool:
+        return self.loop_at is not None or self.finish_reason == "length"
+
+    @property
+    def kept_text(self) -> str:
+        """The reply without the looping part."""
+        return self.text if self.loop_at is None else self.text[: self.loop_at].rstrip()
+
+
 class LlamaPageReader:
-    """Sends one page image + prompt to llama-server and returns the raw reply."""
+    """Sends one page image + prompt to llama-server and returns the raw reply.
+
+    Replies are streamed so a loop can be stopped as soon as it shows (see
+    loops.py) instead of running to the token limit. A page that loops is read
+    once more with DRY sampling; a page that hits the limit without looping is
+    read once more with `retry_max_new_tokens`. If the second reading is still
+    cut off, the longer of the two is kept and the page is marked truncated.
+    """
 
     def __init__(self, server: LlamaServer, cfg: ScanConfig, *, request_timeout: float = 1800, log=print,
-                 after_read: Callable[[], object] | None = None):
+                 after_read: Callable[[], object] | None = None, retry: bool = True):
         self.server = server
         self.cfg = cfg
         self.timeout = request_timeout
         self.log = log
+        self.retry = retry
         # Called after each page, e.g. JitCache.save, so kernels the T4 compiled
         # for that page reach Drive even if the session dies later.
         self.after_read = after_read
         self._text_only_tokens: dict[str, int] = {}
 
-    def _post(self, payload: dict) -> dict:
-        req = urllib.request.Request(
+    def _request(self, payload: dict) -> urllib.request.Request:
+        return urllib.request.Request(
             f"{self.server.base_url}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
+
+    def _post(self, payload: dict) -> dict:
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(self._request(payload), timeout=self.timeout) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")[:1000]
             raise RuntimeError(f"llama-server returned HTTP {e.code}: {body}") from None
 
-    def _payload(self, content: list[dict], max_tokens: int) -> dict:
+    def _stream(self, payload: dict) -> _Attempt:
+        """Stream one reply, stopping early if it starts looping."""
+        payload = {**payload, "stream": True, "stream_options": {"include_usage": True}}
+        parts: list[str] = []
+        length = checked = chunks = 0
+        finish = None
+        usage: dict = {}
+        loop_at = None
+        try:
+            # Leaving this block closes the connection, which makes llama-server
+            # stop generating.
+            with urllib.request.urlopen(self._request(payload), timeout=self.timeout) as resp:
+                for line in resp:
+                    line = line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        break
+                    obj = json.loads(data)
+                    if "error" in obj:
+                        raise RuntimeError(f"llama-server error: {json.dumps(obj['error'])[:1000]}")
+                    usage = obj.get("usage") or usage
+                    for choice in obj.get("choices") or []:
+                        piece = (choice.get("delta") or {}).get("content") or ""
+                        if piece:
+                            parts.append(piece)
+                            length += len(piece)
+                            chunks += 1
+                        finish = choice.get("finish_reason") or finish
+                    if length - checked >= 200:
+                        checked = length
+                        loop_at = find_loop("".join(parts))
+                        if loop_at is not None:
+                            break
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:1000]
+            raise RuntimeError(f"llama-server returned HTTP {e.code}: {body}") from None
+        text = "".join(parts)
+        if loop_at is None and finish == "length":
+            loop_at = find_loop(text)
+        return _Attempt(
+            text=text,
+            finish_reason=finish,
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=int(usage.get("completion_tokens") or chunks),
+            loop_at=loop_at,
+        )
+
+    def _payload(self, content: list[dict], max_tokens: int, **extra) -> dict:
         return {
             "messages": [{"role": "user", "content": content}],
             "max_tokens": max_tokens,
             "temperature": 0,     # greedy: transcription wants the likeliest text, not variety
             "chat_template_kwargs": {"enable_thinking": False},
+            **extra,
         }
 
     def _baseline_tokens(self, prompt: str) -> int | None:
@@ -531,22 +647,34 @@ class LlamaPageReader:
             {"type": "image_url", "image_url": {"url": _png_data_uri(image)}},  # image first, per Google
             {"type": "text", "text": prompt},
         ]
-        r = self._post(self._payload(content, self.cfg.max_new_tokens))
-        choice = r["choices"][0]
-        raw = choice["message"].get("content") or ""
-        usage = r.get("usage") or {}
-        prompt_tokens = usage.get("prompt_tokens")
+        first = self._stream(self._payload(content, self.cfg.max_new_tokens))
+        attempts = [first]
+        retry_mode = None
+        if first.cut_off and self.retry:
+            if first.loop_at is not None:
+                retry_mode = "dry"
+                second = self._stream(self._payload(content, self.cfg.max_new_tokens, **DRY_SETTINGS))
+            else:
+                retry_mode = "longer"
+                second = self._stream(self._payload(content, self.cfg.retry_max_new_tokens))
+            attempts.append(second)
+        final = attempts[-1]
+        if final.cut_off and len(attempts) > 1 and len(first.kept_text) > len(final.kept_text):
+            final = first
+        prompt_tokens = next((a.prompt_tokens for a in attempts if a.prompt_tokens is not None), None)
         base = self._baseline_tokens(prompt)
         image_tokens = prompt_tokens - base if (prompt_tokens is not None and base is not None) else None
         elapsed = time.time() - t0
         if self.after_read is not None:
             self.after_read()
         return ReadResult(
-            raw=raw,
-            output_tokens=int(usage.get("completion_tokens") or 0),
+            raw=final.kept_text,
+            output_tokens=sum(a.completion_tokens for a in attempts),
             image_soft_tokens=image_tokens,
             elapsed_s=elapsed,
-            truncated=choice.get("finish_reason") == "length",
+            truncated=final.cut_off,
+            loop_detected=any(a.loop_at is not None for a in attempts),
+            retry_mode=retry_mode,
         )
 
     def recover(self) -> None:

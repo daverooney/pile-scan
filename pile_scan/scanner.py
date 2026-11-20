@@ -17,6 +17,7 @@ class ScanSummary:
     end_reason: str = "finished"
     pages_read: int = 0
     pages_failed: int = 0
+    pages_truncated: int = 0   # read, but still cut off after a retry
     pages_skipped: int = 0
     files_seen: int = 0
     files_unsupported: list[str] = field(default_factory=list)
@@ -64,7 +65,7 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
         since_checkpoint = 0
         c = db.counts(conn)
         log(f"  checkpoint → {drive_db} ({secs:.1f}s) · {c.get('pages_done', 0)} done, "
-            f"{c.get('pages_error', 0)} failed in total")
+            f"{c.get('pages_truncated', 0)} cut off, {c.get('pages_error', 0)} failed in total")
 
     found = files.discover(cfg.input_dir, recursive=cfg.recursive)
     seen_hashes: set[str] = set()
@@ -127,7 +128,9 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
                         result = reader.read(page.image, prompt)
                         values = extract.parse_response(result.raw)
                         values["truncated"] = int(bool(values["truncated"] or result.truncated))
-                        values.update(base, status="done", elapsed_s=result.elapsed_s,
+                        values.update(base, status="truncated" if values["truncated"] else "done",
+                                      loop_detected=int(result.loop_detected), retry_mode=result.retry_mode,
+                                      elapsed_s=result.elapsed_s,
                                       output_tokens=result.output_tokens,
                                       image_soft_tokens=result.image_soft_tokens, error=None)
                         db.save_page(conn, sha, page.index, values)
@@ -138,7 +141,14 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
                             log(f"  image tokens on first page: {result.image_soft_tokens} "
                                 f"(budget {cfg.max_soft_tokens}; a little under is normal, "
                                 f"near 280 means the setting was ignored)")
-                        flag = " [TRUNCATED]" if values["truncated"] else ""
+                        flag = ""
+                        if result.loop_detected:
+                            flag += " [loop stopped" + (f", re-read ({result.retry_mode})]" if result.retry_mode else "]")
+                        elif result.retry_mode:
+                            flag += f" [re-read ({result.retry_mode})]"
+                        if values["truncated"]:
+                            flag += " [TRUNCATED]"
+                            summary.pages_truncated += 1
                         log(f"[{summary.pages_read}] {label} · {result.elapsed_s:.1f}s · "
                             f"{result.output_tokens} tok · {_short(values['doc_title'], 40)}{flag}")
                     except Exception as exc:
@@ -171,8 +181,10 @@ def run_scan(cfg: ScanConfig, reader: PageReader | None, *, log=print,
         conn.close()
 
     log(f"Run {run_id} {summary.end_reason}: read {summary.pages_read} pages, "
-        f"{summary.pages_failed} failed, {summary.pages_skipped} already done, "
-        f"in {summary.seconds / 60:.1f} min.")
+        f"{summary.pages_truncated} still cut off, {summary.pages_failed} failed, "
+        f"{summary.pages_skipped} already done, in {summary.seconds / 60:.1f} min.")
+    if summary.pages_truncated:
+        log("Pages still cut off are saved with status 'truncated'. Tick RETRY_ERRORS to read them again.")
     if summary.files_duplicate:
         log(f"{len(summary.files_duplicate)} files were exact copies of others and were scanned once.")
     if summary.files_unsupported:
